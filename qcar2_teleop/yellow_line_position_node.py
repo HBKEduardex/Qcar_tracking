@@ -81,7 +81,7 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('num_sample_rows', 12)
         self.declare_parameter('poly_degree', 2)
         self.declare_parameter('lookahead_ratio', 0.4)
-        self.declare_parameter('ackermann_gain', 0.15)
+        self.declare_parameter('ackermann_gain', 0.24)
         self.declare_parameter('min_fit_points', 5)
         self.declare_parameter('curvature_threshold', 0.0005)
         self.declare_parameter('edge_hold_frames', 15)
