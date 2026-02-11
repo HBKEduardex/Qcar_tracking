@@ -66,9 +66,9 @@ class YellowLineFollowerController(Node):
         self.declare_parameter('cmd_topic', '/qcar2_motor_speed_cmd')
 
         # PID
-        self.declare_parameter('kp', 1.2)
-        self.declare_parameter('ki', 0.0)
-        self.declare_parameter('kd', 0.08)
+        self.declare_parameter('kp', 0.5263157894736842)
+        self.declare_parameter('ki', 0.042105263157894736)
+        self.declare_parameter('kd', 0.16842105263157894)
         self.declare_parameter('integral_limit', 0.8)
 
         # Limits / speed

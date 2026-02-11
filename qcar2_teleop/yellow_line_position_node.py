@@ -83,9 +83,12 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('lookahead_ratio', 0.4)
         self.declare_parameter('ackermann_gain', 0.24)
         self.declare_parameter('min_fit_points', 5)
-        self.declare_parameter('curvature_threshold', 0.0005)
+        self.declare_parameter('curvature_threshold', 0.009)
         self.declare_parameter('edge_hold_frames', 15)
         self.declare_parameter('edge_ema_alpha', 0.3)
+        self.declare_parameter('curvature_ema_alpha', 0.15)
+        self.declare_parameter('curve_exit_frames', 5)
+        self.declare_parameter('straight_offset_px', 22)  # positive = shift right (towards edge)
 
         # ==================== Load params ====================
         self.mask_topic = self.get_parameter('mask_topic').value
@@ -116,6 +119,9 @@ class YellowLinePositionNode(Node):
         self.curvature_threshold = float(self.get_parameter('curvature_threshold').value)
         self.edge_hold_frames = int(self.get_parameter('edge_hold_frames').value)
         self.edge_ema_alpha = float(self.get_parameter('edge_ema_alpha').value)
+        self.curvature_ema_alpha = float(self.get_parameter('curvature_ema_alpha').value)
+        self.curve_exit_frames = int(self.get_parameter('curve_exit_frames').value)
+        self.straight_offset_px = int(self.get_parameter('straight_offset_px').value)
 
         # ==================== State ====================
         self.bridge = CvBridge()
@@ -125,6 +131,8 @@ class YellowLinePositionNode(Node):
         self.last_edge_cx = None           # edge memory
         self.edge_lost_count = 0           # frames since edge was last seen
         self.last_edge_poly = None         # polynomial memory
+        self.smoothed_curvature = 0.0      # EMA-smoothed curvature
+        self.straight_count = 0            # consecutive frames below threshold
 
         # ==================== ROS I/O ====================
         self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
@@ -315,9 +323,15 @@ class YellowLinePositionNode(Node):
                 center_poly = offset_poly
             poly_valid = True
 
-        # Extract curvature
+        # Extract curvature (raw)
+        raw_curvature = 0.0
         if center_poly is not None and len(center_poly) >= 3:
-            curvature = float(center_poly[0])
+            raw_curvature = float(center_poly[0])
+
+        # Smooth curvature with EMA
+        ca = self.curvature_ema_alpha
+        self.smoothed_curvature = (1.0 - ca) * self.smoothed_curvature + ca * raw_curvature
+        curvature = self.smoothed_curvature
 
         # Ackermann offset (for curve mode)
         if center_poly is not None:
@@ -345,7 +359,15 @@ class YellowLinePositionNode(Node):
             self.lane_width_px = float(clamp(self.default_lane_width_ratio, 0.05, 0.99)) * w
 
         # ================== 5) Decide mode & compute error ==================
-        in_curve = abs(curvature) >= self.curvature_threshold and poly_valid
+        # Hysteresis: enter curve immediately, but require N straight frames to exit
+        is_above_thresh = abs(curvature) >= self.curvature_threshold and poly_valid
+        if is_above_thresh:
+            self.straight_count = 0
+            in_curve = True
+        else:
+            self.straight_count += 1
+            in_curve = self.straight_count < self.curve_exit_frames  # stay in curve until confirmed straight
+
         lane_center_x = None
         lookahead_y = int(h * (1.0 - self.lookahead_ratio))
         lookahead_y = int(clamp(lookahead_y, 2, h - 2))
@@ -362,7 +384,7 @@ class YellowLinePositionNode(Node):
                     lane_center_x = int((yellow_cx + edge_cx) / 2.0)
                 else:
                     lane_center_x = int(edge_cx - 0.5 * float(self.lane_width_px))
-                lane_center_x = int(clamp(lane_center_x, 0, w - 1))
+                lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
             else:
