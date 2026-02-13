@@ -104,6 +104,18 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('max_center_jump_px', 25)         # CALIBRATE: max lane_center_x change per frame (px). Lower = smoother, slower
         self.declare_parameter('yellow_safety_margin_px', 30)    # CALIBRATE: min distance from center to yellow (px). Higher = stays further right
 
+        # ==================== Emergency lane recovery ====================
+        self.declare_parameter('left_edge_ratio', 0.45)          # CALIBRATE: edge_cx < this * W means edge is on left (invasion)
+        self.declare_parameter('yellow_right_ratio', 0.50)       # CALIBRATE: yellow_cx > this * W means yellow crossed to right
+        self.declare_parameter('right_edge_min_ratio', 0.55)     # CALIBRATE: where right edge should be (x > this * W)
+        self.declare_parameter('min_right_edge_pixels', 40)      # CALIBRATE: min edge pixels in right half to consider valid
+        self.declare_parameter('pre_emergency_frames', 3)        # CALIBRATE: frames to enter pre-emergency
+        self.declare_parameter('emergency_frames', 5)            # CALIBRATE: frames to confirm full emergency
+        self.declare_parameter('emergency_hold_frames', 10)      # CALIBRATE: hold emergency for N frames after pattern clears
+        self.declare_parameter('emergency_steer_override', -1) # CALIBRATE: forced center_error (neg = RIGHT steer). Range [-1, 0]
+        self.declare_parameter('emergency_speed_scale', 0.5)     # CALIBRATE: speed multiplier during emergency [0.3-0.8]
+        self.declare_parameter('pre_emergency_bias_px', 30)      # CALIBRATE: rightward pixel bias during pre-emergency
+
         # ==================== Load params ====================
         self.mask_topic = self.get_parameter('mask_topic').value
         self.yellow_error_topic = self.get_parameter('yellow_error_topic').value
@@ -146,6 +158,16 @@ class YellowLinePositionNode(Node):
         self.triangle_exit_frames = int(self.get_parameter('triangle_exit_frames').value)
         self.max_center_jump_px = int(self.get_parameter('max_center_jump_px').value)
         self.yellow_safety_margin_px = int(self.get_parameter('yellow_safety_margin_px').value)
+        self.left_edge_ratio = float(self.get_parameter('left_edge_ratio').value)
+        self.yellow_right_ratio = float(self.get_parameter('yellow_right_ratio').value)
+        self.right_edge_min_ratio = float(self.get_parameter('right_edge_min_ratio').value)
+        self.min_right_edge_pixels = int(self.get_parameter('min_right_edge_pixels').value)
+        self.pre_emergency_frames = int(self.get_parameter('pre_emergency_frames').value)
+        self.emergency_frames_needed = int(self.get_parameter('emergency_frames').value)
+        self.emergency_hold_frames = int(self.get_parameter('emergency_hold_frames').value)
+        self.emergency_steer_override = float(self.get_parameter('emergency_steer_override').value)
+        self.emergency_speed_scale = float(self.get_parameter('emergency_speed_scale').value)
+        self.pre_emergency_bias_px = int(self.get_parameter('pre_emergency_bias_px').value)
 
         # ==================== State ====================
         self.bridge = CvBridge()
@@ -162,6 +184,10 @@ class YellowLinePositionNode(Node):
         self.triangle_count = 0            # frames counter for triangle hysteresis
         self.triangle_active = False       # triangle mode active flag
         self.last_extra_status = ''        # 'TRIANGLE', 'YEL_RISK', 'RATE_LIM'
+        # Emergency state: 'NORMAL', 'PRE_EMERG', 'EMERGENCY', 'RECOVERY'
+        self.emergency_state = 'NORMAL'
+        self.invasion_count = 0            # frames with invasion pattern
+        self.recovery_count = 0            # frames in recovery hold
 
         # ==================== ROS I/O ====================
         self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
@@ -170,6 +196,10 @@ class YellowLinePositionNode(Node):
         self.pub_c_err = self.create_publisher(Float32, self.center_error_topic, 10)
         self.pub_c_vis = self.create_publisher(Bool, self.center_visible_topic, 10)
         self.pub_curv = self.create_publisher(Float32, self.curvature_topic, 10)
+        # Emergency topics
+        self.pub_emerg_active = self.create_publisher(Bool, '/lane/emergency/active', 10)
+        self.pub_emerg_steer = self.create_publisher(Float32, '/lane/emergency/steer_override', 10)
+        self.pub_emerg_speed = self.create_publisher(Float32, '/lane/emergency/speed_scale', 10)
 
         if self.show_detection_window:
             cv2.namedWindow('lane_detection', cv2.WINDOW_NORMAL)
@@ -284,11 +314,28 @@ class YellowLinePositionNode(Node):
             return int(np.mean(right_road))
         return int(np.mean(road_xs))
 
+    def _sweep_find_road_x(self, roi_bgr, h, w, start_x=None):
+        """Sweep outward from start_x to find the nearest column that is on road.
+           Guaranteed to return road x or None if absolutely no road exists."""
+        if start_x is None:
+            start_x = w // 2
+        start_x = int(clamp(start_x, 0, w - 1))
+        # Sample vertical road ratio at columns expanding outward
+        for offset in range(0, w):
+            for candidate in [start_x - offset, start_x + offset]:
+                if 0 <= candidate < w:
+                    ratio = self._road_ratio_at_x(roi_bgr, candidate, h)
+                    if ratio >= self.min_road_ratio:  # CALIBRATE
+                        return candidate
+        return None
+
     def _validate_and_fix_center(self, roi_bgr, lane_center_x, h, w,
                                   yellow_cx, edge_cx, lane_width_px, offset_px):
         """Validate that lane_center_x is on road, not sidewalk.
+           GUARANTEES: returned x is on road, or last known good is used.
            Returns (validated_x, status_string).
-           status_string: '' = ok, 'FLIP' = offset flipped, 'FALLBACK' = road projection."""
+           status_string: '' = ok, 'FLIP' = offset flipped, 'FALLBACK' = road projection,
+                          'SWEEP' = sweep search."""
         if lane_center_x is None or not self.sidewalk_validate:
             return lane_center_x, ''
 
@@ -297,8 +344,7 @@ class YellowLinePositionNode(Node):
         if ratio >= self.min_road_ratio:  # CALIBRATE: min_road_ratio
             return lane_center_x, ''  # valid
 
-        # --- Step 2: Flip offset direction ---
-        # Determine base point and reverse the offset
+        # --- Step 2: Flip offset direction (mirror) ---
         flipped_x = None
         if yellow_cx is not None and edge_cx is not None:
             # Both visible: center was average, flip by shifting opposite to offset
@@ -318,16 +364,88 @@ class YellowLinePositionNode(Node):
             if flip_ratio >= self.min_road_ratio:
                 return flipped_x, 'FLIP'
 
-        # --- Step 3: Fallback to road projection ---
+        # --- Step 3: Fallback to road projection (bottom third centroid) ---
         fallback_x = self._project_to_road(roi_bgr, h, w,
                                             prefer_x=self.last_lane_center_x)
         if fallback_x is not None:
-            return fallback_x, 'FALLBACK'
+            fb_ratio = self._road_ratio_at_x(roi_bgr, fallback_x, h)
+            if fb_ratio >= self.min_road_ratio:
+                return fallback_x, 'FALLBACK'
 
-        # Nothing worked, return original (better than nothing)
+        # --- Step 4: Sweep search — scan outward from center (GUARANTEED) ---
+        sweep_x = self._sweep_find_road_x(roi_bgr, h, w,
+                                           start_x=lane_center_x)
+        if sweep_x is not None:
+            return sweep_x, 'SWEEP'
+
+        # Absolute last resort: hold last known good position
+        if self.last_lane_center_x is not None:
+            return self.last_lane_center_x, 'HOLD'
+
         return lane_center_x, ''
-
     # ================================================================
+    #  Emergency invasion detection helpers
+    # ================================================================
+    def _detect_invasion(self, edge_bin, edge_cx, yellow_cx, w, h):
+        """Detect inverted pattern: edge on left + yellow on center/right.
+           Returns True if invasion pattern is detected this frame."""
+        # Check 1: edge centroid is on the left side
+        edge_left = (edge_cx is not None and
+                     edge_cx < self.left_edge_ratio * w)  # CALIBRATE: left_edge_ratio
+
+        # Check 2: yellow centroid is on center/right side
+        yellow_right = (yellow_cx is not None and
+                        yellow_cx > self.yellow_right_ratio * w)  # CALIBRATE: yellow_right_ratio
+
+        # Check 3: no substantial edge on the right half
+        right_boundary = int(self.right_edge_min_ratio * w)  # CALIBRATE: right_edge_min_ratio
+        right_edge_pixels = int(cv2.countNonZero(edge_bin[:, right_boundary:]))
+        edge_right_missing = right_edge_pixels < self.min_right_edge_pixels  # CALIBRATE
+
+        # Invasion = edge on left AND (yellow crossed right OR no right edge)
+        return edge_left and (yellow_right or edge_right_missing)
+
+    def _update_emergency_state(self, invasion_pattern):
+        """State machine: NORMAL → PRE_EMERG → EMERGENCY → RECOVERY → NORMAL."""
+        if self.emergency_state == 'NORMAL':
+            if invasion_pattern:
+                self.invasion_count += 1
+                if self.invasion_count >= self.pre_emergency_frames:  # CALIBRATE
+                    self.emergency_state = 'PRE_EMERG'
+                    # Don't reset count — keep accumulating for emergency
+            else:
+                self.invasion_count = max(0, self.invasion_count - 1)
+
+        elif self.emergency_state == 'PRE_EMERG':
+            if invasion_pattern:
+                self.invasion_count += 1
+                if self.invasion_count >= (self.pre_emergency_frames +
+                                           self.emergency_frames_needed):  # CALIBRATE
+                    self.emergency_state = 'EMERGENCY'
+                    self.recovery_count = 0
+            else:
+                self.invasion_count = max(0, self.invasion_count - 1)
+                if self.invasion_count < self.pre_emergency_frames:
+                    self.emergency_state = 'NORMAL'
+
+        elif self.emergency_state == 'EMERGENCY':
+            if not invasion_pattern:
+                # Pattern cleared — enter recovery hold
+                self.emergency_state = 'RECOVERY'
+                self.recovery_count = 0
+            # Stay in EMERGENCY while pattern persists
+
+        elif self.emergency_state == 'RECOVERY':
+            self.recovery_count += 1
+            if invasion_pattern:
+                # Pattern came back — re-enter emergency
+                self.emergency_state = 'EMERGENCY'
+                self.recovery_count = 0
+            elif self.recovery_count >= self.emergency_hold_frames:  # CALIBRATE
+                self.emergency_state = 'NORMAL'
+                self.invasion_count = 0
+                self.recovery_count = 0
+
     #  Main callback
     # ================================================================
     def cb_mask(self, msg: Image):
@@ -435,6 +553,21 @@ class YellowLinePositionNode(Node):
                 edge_cx = int(self.last_edge_cx)
                 edge_visible = True  # treat as visible (held)
 
+        # ================== 2b) Invasion detection ==================
+        invasion_pattern = self._detect_invasion(edge_bin, edge_cx, yellow_cx, w, h)
+        self._update_emergency_state(invasion_pattern)
+        emergency_active = self.emergency_state in ('EMERGENCY', 'RECOVERY')
+        pre_emergency = self.emergency_state == 'PRE_EMERG'
+
+        # Publish emergency topics every frame
+        self.pub_emerg_active.publish(Bool(data=emergency_active))
+        if emergency_active:
+            self.pub_emerg_steer.publish(Float32(data=self.emergency_steer_override))
+            self.pub_emerg_speed.publish(Float32(data=self.emergency_speed_scale))
+        else:
+            self.pub_emerg_steer.publish(Float32(data=0.0))
+            self.pub_emerg_speed.publish(Float32(data=1.0))
+
         # ================== 3) Polynomial fitting (always, for curvature) ==================
         y_ys, y_xs = np.array([]), np.array([])
         e_ys, e_xs = np.array([]), np.array([])
@@ -534,7 +667,15 @@ class YellowLinePositionNode(Node):
         lookahead_y = int(h * (1.0 - self.lookahead_ratio))
         lookahead_y = int(clamp(lookahead_y, 2, h - 2))
 
-        if in_curve and center_poly_ack is not None:
+        if emergency_active:
+            # ---- EMERGENCY MODE: skip normal center, find safe road point ----
+            safe_x = self._project_to_road(roi, h, w, prefer_x=self.last_lane_center_x)
+            if safe_x is not None:
+                lane_center_x = safe_x
+            elif self.last_lane_center_x is not None:
+                lane_center_x = self.last_lane_center_x
+            # Note: center_error will be overridden below anyway
+        elif in_curve and center_poly_ack is not None:
             # ---- CURVE MODE: polynomial + Ackermann + lookahead ----
             lane_center_x = int(clamp(np.polyval(center_poly_ack, lookahead_y), 0, w - 1))
             self.last_lane_center_x = lane_center_x
@@ -561,8 +702,16 @@ class YellowLinePositionNode(Node):
                 if self.last_lane_center_x is not None:
                     lane_center_x = self.last_lane_center_x
 
+        # Pre-emergency: apply rightward bias
+        if pre_emergency and lane_center_x is not None:
+            lane_center_x = int(clamp(
+                lane_center_x - self.pre_emergency_bias_px, 0, w - 1))
+            if not self.last_extra_status:
+                self.last_extra_status = 'PRE_EMERG'
+
         # ================== Yellow proximity risk ==================
-        self.last_extra_status = ''
+        if not self.last_extra_status:  # don't overwrite pre-emergency status
+            self.last_extra_status = ''
         if (lane_center_x is not None and yellow_visible and yellow_cx is not None
                 and not self.triangle_active):
             dist_to_yellow = lane_center_x - yellow_cx
@@ -584,17 +733,29 @@ class YellowLinePositionNode(Node):
 
         # ================== Rate limiter ==================
         if (lane_center_x is not None and self.last_lane_center_x is not None
-                and self.max_center_jump_px > 0):
+                and self.max_center_jump_px > 0 and not emergency_active):
+            max_jump = self.max_center_jump_px
+            # Asymmetric during pre-emergency: allow rightward (negative delta) freely
+            if pre_emergency:
+                max_jump_left = max_jump // 2   # restrict leftward movement
+                max_jump_right = max_jump * 2   # allow rightward movement
+            else:
+                max_jump_left = max_jump
+                max_jump_right = max_jump
             delta = lane_center_x - self.last_lane_center_x
-            if abs(delta) > self.max_center_jump_px:
-                lane_center_x = self.last_lane_center_x + int(
-                    np.sign(delta) * self.max_center_jump_px)
+            if delta > 0 and delta > max_jump_left:     # moving left (higher x = more left in error terms)
+                lane_center_x = self.last_lane_center_x + max_jump_left
+                lane_center_x = int(clamp(lane_center_x, 0, w - 1))
+                if not self.last_extra_status:
+                    self.last_extra_status = 'RATE_LIM'
+            elif delta < 0 and abs(delta) > max_jump_right:  # moving right
+                lane_center_x = self.last_lane_center_x - max_jump_right
                 lane_center_x = int(clamp(lane_center_x, 0, w - 1))
                 if not self.last_extra_status:
                     self.last_extra_status = 'RATE_LIM'
 
         # Smooth lane_center_x with EMA to prevent jumps
-        if lane_center_x is not None:
+        if lane_center_x is not None and not emergency_active:
             if self.smoothed_center_x is None:
                 self.smoothed_center_x = float(lane_center_x)
             else:
@@ -603,7 +764,11 @@ class YellowLinePositionNode(Node):
             lane_center_x = int(clamp(self.smoothed_center_x, 0, w - 1))
 
         # Error
-        if lane_center_x is not None:
+        if emergency_active:
+            # EMERGENCY OVERRIDE: force hard right steer
+            center_error = float(self.emergency_steer_override)  # neg = RIGHT
+            self.center_has_value = True
+        elif lane_center_x is not None:
             center_error = (lane_center_x - (w / 2.0)) / (w / 2.0)
             center_error = float(clamp(center_error, -1.0, 1.0))
         else:
@@ -619,6 +784,7 @@ class YellowLinePositionNode(Node):
                 yellow_visible, yellow_cx, edge_visible, edge_cx,
                 lane_center_x, in_curve,
                 yellow_pixels, edge_pixels, yellow_error, center_error, curvature,
+                emergency_active, pre_emergency,
             )
 
         if self.show_prediction_window:
@@ -639,6 +805,7 @@ class YellowLinePositionNode(Node):
         yellow_visible, yellow_cx, edge_visible, edge_cx,
         lane_center_x, in_curve,
         yellow_pixels, edge_pixels, yellow_error, center_error, curvature,
+        emergency_active=False, pre_emergency=False,
     ):
         dbg = roi.copy()
 
@@ -675,19 +842,35 @@ class YellowLinePositionNode(Node):
         cv2.putText(dbg,
                     f"MODO: {mode_str} | curv={curvature:.5f}",
                     (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_clr, 2)
-        # Validation + extra status indicators
+
+        # Emergency / validation / extra status indicators
         status_y = 100
+        if emergency_active:
+            # Flash effect: red rectangle background
+            cv2.rectangle(dbg, (5, status_y - 18), (280, status_y + 5), (0, 0, 180), -1)
+            cv2.putText(dbg, '!! EMERGENCY - RIGHT !!',
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            status_y += 25
+        elif pre_emergency:
+            cv2.putText(dbg, '!! PRE_EMERG !!',
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            status_y += 25
         if self.triangle_active:
             cv2.putText(dbg, '!! TRIANGLE !!',
                         (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             status_y += 25
         if self.last_validation_status:
-            val_clr = (0, 165, 255) if self.last_validation_status == 'FLIP' else (0, 0, 255)
+            val_clr = {
+                'FLIP': (0, 165, 255),      # orange
+                'FALLBACK': (0, 0, 255),    # red
+                'SWEEP': (255, 0, 200),     # magenta
+                'HOLD': (140, 140, 140),    # gray
+            }.get(self.last_validation_status, (0, 0, 255))
             cv2.putText(dbg,
                         f"!! {self.last_validation_status} !!",
                         (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, val_clr, 2)
             status_y += 25
-        if self.last_extra_status:
+        if self.last_extra_status and not emergency_active:
             extra_clr = {  # CALIBRATE: debug colors
                 'YEL_RISK': (0, 165, 255),   # orange
                 'RATE_LIM': (255, 255, 0),   # cyan

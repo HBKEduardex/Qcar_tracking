@@ -72,7 +72,7 @@ class YellowLineFollowerController(Node):
         self.declare_parameter('integral_limit', 0.8)
 
         # Limits / speed
-        self.declare_parameter('max_angle', 0.45)     # rad
+        self.declare_parameter('max_angle', 0.55)     # rad
         self.declare_parameter('base_speed', 0.35)
         self.declare_parameter('min_speed', 0.15)
         self.declare_parameter('max_speed', 0.30)
@@ -90,8 +90,8 @@ class YellowLineFollowerController(Node):
 
         # Kalman
         self.declare_parameter('use_kalman', True)
-        self.declare_parameter('kalman_q', 0.02)   # sube si responde lento
-        self.declare_parameter('kalman_r', 0.08)   # sube si vibra
+        self.declare_parameter('kalman_q', 0.008)  # CALIBRATE: sube si responde lento (was 0.02)
+        self.declare_parameter('kalman_r', 0.20)    # CALIBRATE: sube si vibra/invade (was 0.08)
         self.declare_parameter('kalman_p0', 1.0)
 
         # Debug pubs
