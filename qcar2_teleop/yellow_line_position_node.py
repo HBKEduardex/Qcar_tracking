@@ -96,6 +96,14 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('min_road_ratio', 0.6)            # CALIBRATE: min fraction of sample points on road
         self.declare_parameter('validate_num_points', 8)         # CALIBRATE: how many vertical points to sample
 
+        # ==================== Triangle / anti-invasion ====================
+        self.declare_parameter('yellow_area_enter_ratio', 0.08)  # CALIBRATE: yellow area ratio to enter triangle mode (normal ~0.02-0.04, triangle ~0.08+)
+        self.declare_parameter('yellow_area_exit_ratio', 0.05)   # CALIBRATE: yellow area ratio to exit triangle mode (must be < enter)
+        self.declare_parameter('triangle_enter_frames', 3)       # CALIBRATE: frames above enter threshold to activate
+        self.declare_parameter('triangle_exit_frames', 5)        # CALIBRATE: frames below exit threshold to deactivate
+        self.declare_parameter('max_center_jump_px', 25)         # CALIBRATE: max lane_center_x change per frame (px). Lower = smoother, slower
+        self.declare_parameter('yellow_safety_margin_px', 30)    # CALIBRATE: min distance from center to yellow (px). Higher = stays further right
+
         # ==================== Load params ====================
         self.mask_topic = self.get_parameter('mask_topic').value
         self.yellow_error_topic = self.get_parameter('yellow_error_topic').value
@@ -132,6 +140,12 @@ class YellowLinePositionNode(Node):
         self.sidewalk_validate = bool(self.get_parameter('sidewalk_validate').value)
         self.min_road_ratio = float(self.get_parameter('min_road_ratio').value)
         self.validate_num_points = int(self.get_parameter('validate_num_points').value)
+        self.yellow_area_enter_ratio = float(self.get_parameter('yellow_area_enter_ratio').value)
+        self.yellow_area_exit_ratio = float(self.get_parameter('yellow_area_exit_ratio').value)
+        self.triangle_enter_frames = int(self.get_parameter('triangle_enter_frames').value)
+        self.triangle_exit_frames = int(self.get_parameter('triangle_exit_frames').value)
+        self.max_center_jump_px = int(self.get_parameter('max_center_jump_px').value)
+        self.yellow_safety_margin_px = int(self.get_parameter('yellow_safety_margin_px').value)
 
         # ==================== State ====================
         self.bridge = CvBridge()
@@ -145,6 +159,9 @@ class YellowLinePositionNode(Node):
         self.straight_count = 0            # consecutive frames below threshold
         self.smoothed_center_x = None      # EMA-smoothed lane center
         self.last_validation_status = ''    # '', 'FLIP', or 'FALLBACK'
+        self.triangle_count = 0            # frames counter for triangle hysteresis
+        self.triangle_active = False       # triangle mode active flag
+        self.last_extra_status = ''        # 'TRIANGLE', 'YEL_RISK', 'RATE_LIM'
 
         # ==================== ROS I/O ====================
         self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
@@ -357,6 +374,35 @@ class YellowLinePositionNode(Node):
         self.pub_y_vis.publish(Bool(data=yellow_visible))
         self.pub_y_err.publish(Float32(data=yellow_error))
 
+        # ---- Triangle / double yellow detection (area-based) ----
+        roi_area = float(h * w) if (h * w) > 0 else 1.0
+        yellow_area_ratio = yellow_pixels / roi_area
+        if self.triangle_active:
+            # Currently in triangle mode — check exit condition
+            if yellow_area_ratio < self.yellow_area_exit_ratio:
+                self.triangle_count += 1
+            else:
+                self.triangle_count = 0
+            if self.triangle_count >= self.triangle_exit_frames:
+                self.triangle_active = False
+                self.triangle_count = 0
+        else:
+            # Check enter condition
+            if yellow_area_ratio > self.yellow_area_enter_ratio:
+                self.triangle_count += 1
+            else:
+                self.triangle_count = max(0, self.triangle_count - 1)
+            if self.triangle_count >= self.triangle_enter_frames:
+                self.triangle_active = True
+                self.triangle_count = 0
+
+        # When triangle mode is active, suppress yellow for center calc only
+        yellow_for_center = yellow_visible  # original visibility
+        yellow_cx_for_center = yellow_cx    # original centroid
+        if self.triangle_active:
+            yellow_for_center = False
+            yellow_cx_for_center = None
+
         # ================== 2) Edge detection ==================
         b, g, r = cv2.split(roi)
         edge_bin = ((r > 150) & (g < 100) & (b < 100)).astype(np.uint8) * 255
@@ -399,7 +445,7 @@ class YellowLinePositionNode(Node):
         curvature = 0.0
         poly_valid = False
 
-        if yellow_visible:
+        if yellow_for_center:  # use suppressed flag (triangle-aware)
             y_ys, y_xs = self._sample_yellow_per_row(yellow_bin, sample_ys)
             if len(y_ys) >= self.min_fit_points:
                 yellow_poly = self._safe_polyfit(y_ys, y_xs, self.poly_degree)
@@ -415,7 +461,7 @@ class YellowLinePositionNode(Node):
         if edge_poly is None and self.last_edge_poly is not None and self.edge_lost_count <= self.edge_hold_frames:
             edge_poly = self.last_edge_poly.copy()
 
-        # Center poly
+        # Center poly (uses triangle-suppressed yellow_poly)
         if edge_poly is not None:
             if yellow_poly is not None:
                 center_poly = (np.array(yellow_poly) + np.array(edge_poly)) / 2.0
@@ -459,6 +505,7 @@ class YellowLinePositionNode(Node):
         self.pub_curv.publish(Float32(data=curvature))
 
         # ================== 4) Learn lane width ==================
+        # Always learn from original detections (not triangle-suppressed)
         if yellow_visible and edge_visible and yellow_cx is not None and edge_cx is not None:
             width_px_meas = float(edge_cx - yellow_cx)
             min_w = self.min_lane_width_ratio * w
@@ -493,19 +540,19 @@ class YellowLinePositionNode(Node):
             self.last_lane_center_x = lane_center_x
             self.center_has_value = True
         else:
-            # ---- STRAIGHT MODE: simple point centroid (original) ----
+            # ---- STRAIGHT MODE: simple point centroid (triangle-aware) ----
             if edge_visible and edge_cx is not None:
-                if yellow_visible and yellow_cx is not None:
-                    lane_center_x = int((yellow_cx + edge_cx) / 2.0)
+                if yellow_for_center and yellow_cx_for_center is not None:
+                    lane_center_x = int((yellow_cx_for_center + edge_cx) / 2.0)
                 else:
-                    # Edge only → shift left
+                    # Edge only (or triangle suppressed yellow) → shift left
                     lane_center_x = int(edge_cx - 0.5 * float(self.lane_width_px))
                 lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
-            elif yellow_visible and yellow_cx is not None:
-                # Yellow only → shift right (inverse)
-                lane_center_x = int(yellow_cx + 0.5 * float(self.lane_width_px))
+            elif yellow_for_center and yellow_cx_for_center is not None:
+                # Yellow only (not suppressed) → shift right (inverse)
+                lane_center_x = int(yellow_cx_for_center + 0.5 * float(self.lane_width_px))
                 lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
@@ -514,16 +561,37 @@ class YellowLinePositionNode(Node):
                 if self.last_lane_center_x is not None:
                     lane_center_x = self.last_lane_center_x
 
+        # ================== Yellow proximity risk ==================
+        self.last_extra_status = ''
+        if (lane_center_x is not None and yellow_visible and yellow_cx is not None
+                and not self.triangle_active):
+            dist_to_yellow = lane_center_x - yellow_cx
+            if dist_to_yellow < self.yellow_safety_margin_px:
+                lane_center_x = int(clamp(
+                    yellow_cx + self.yellow_safety_margin_px, 0, w - 1))
+                self.last_extra_status = 'YEL_RISK'
+
         # ================== Sidewalk validation ==================
         self.last_validation_status = ''
         if lane_center_x is not None:
             lane_center_x, self.last_validation_status = self._validate_and_fix_center(
                 roi, lane_center_x, h, w,
-                yellow_cx if yellow_visible else None,
+                yellow_cx_for_center if yellow_for_center else None,
                 edge_cx if edge_visible else None,
                 float(self.lane_width_px),
                 self.straight_offset_px if not in_curve else 0,
             )
+
+        # ================== Rate limiter ==================
+        if (lane_center_x is not None and self.last_lane_center_x is not None
+                and self.max_center_jump_px > 0):
+            delta = lane_center_x - self.last_lane_center_x
+            if abs(delta) > self.max_center_jump_px:
+                lane_center_x = self.last_lane_center_x + int(
+                    np.sign(delta) * self.max_center_jump_px)
+                lane_center_x = int(clamp(lane_center_x, 0, w - 1))
+                if not self.last_extra_status:
+                    self.last_extra_status = 'RATE_LIM'
 
         # Smooth lane_center_x with EMA to prevent jumps
         if lane_center_x is not None:
@@ -607,11 +675,26 @@ class YellowLinePositionNode(Node):
         cv2.putText(dbg,
                     f"MODO: {mode_str} | curv={curvature:.5f}",
                     (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_clr, 2)
+        # Validation + extra status indicators
+        status_y = 100
+        if self.triangle_active:
+            cv2.putText(dbg, '!! TRIANGLE !!',
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            status_y += 25
         if self.last_validation_status:
             val_clr = (0, 165, 255) if self.last_validation_status == 'FLIP' else (0, 0, 255)
             cv2.putText(dbg,
                         f"!! {self.last_validation_status} !!",
-                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, val_clr, 2)
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, val_clr, 2)
+            status_y += 25
+        if self.last_extra_status:
+            extra_clr = {  # CALIBRATE: debug colors
+                'YEL_RISK': (0, 165, 255),   # orange
+                'RATE_LIM': (255, 255, 0),   # cyan
+            }.get(self.last_extra_status, (255, 255, 255))
+            cv2.putText(dbg,
+                        f"!! {self.last_extra_status} !!",
+                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, extra_clr, 2)
 
         cv2.imshow('lane_detection', dbg)
         key = cv2.waitKey(1) & 0xFF
