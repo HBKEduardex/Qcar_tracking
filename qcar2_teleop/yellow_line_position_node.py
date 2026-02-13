@@ -89,6 +89,12 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('curvature_ema_alpha', 0.15)
         self.declare_parameter('curve_exit_frames', 5)
         self.declare_parameter('straight_offset_px', 22)  # positive = shift right (towards edge)
+        self.declare_parameter('center_ema_alpha', 0.4)  # smoothing for lane center transitions
+
+        # ==================== Sidewalk validation ====================
+        self.declare_parameter('sidewalk_validate', True)        # CALIBRATE: enable/disable sidewalk check
+        self.declare_parameter('min_road_ratio', 0.6)            # CALIBRATE: min fraction of sample points on road
+        self.declare_parameter('validate_num_points', 8)         # CALIBRATE: how many vertical points to sample
 
         # ==================== Load params ====================
         self.mask_topic = self.get_parameter('mask_topic').value
@@ -122,6 +128,10 @@ class YellowLinePositionNode(Node):
         self.curvature_ema_alpha = float(self.get_parameter('curvature_ema_alpha').value)
         self.curve_exit_frames = int(self.get_parameter('curve_exit_frames').value)
         self.straight_offset_px = int(self.get_parameter('straight_offset_px').value)
+        self.center_ema_alpha = float(self.get_parameter('center_ema_alpha').value)
+        self.sidewalk_validate = bool(self.get_parameter('sidewalk_validate').value)
+        self.min_road_ratio = float(self.get_parameter('min_road_ratio').value)
+        self.validate_num_points = int(self.get_parameter('validate_num_points').value)
 
         # ==================== State ====================
         self.bridge = CvBridge()
@@ -133,6 +143,8 @@ class YellowLinePositionNode(Node):
         self.last_edge_poly = None         # polynomial memory
         self.smoothed_curvature = 0.0      # EMA-smoothed curvature
         self.straight_count = 0            # consecutive frames below threshold
+        self.smoothed_center_x = None      # EMA-smoothed lane center
+        self.last_validation_status = ''    # '', 'FLIP', or 'FALLBACK'
 
         # ==================== ROS I/O ====================
         self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
@@ -204,6 +216,99 @@ class YellowLinePositionNode(Node):
         if cx < int(self.min_edge_x_ratio * w):
             return None
         return cx
+
+    # ================================================================
+    #  Sidewalk validation helpers
+    # ================================================================
+    def _is_sidewalk(self, roi_bgr, x, y):
+        """Check if pixel (x,y) in the BGR mask is sidewalk (black)."""
+        h, w = roi_bgr.shape[:2]
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return True  # out-of-bounds treated as invalid
+        b, g, r = int(roi_bgr[y, x, 0]), int(roi_bgr[y, x, 1]), int(roi_bgr[y, x, 2])
+        return b < 30 and g < 30 and r < 30  # CALIBRATE: sidewalk color threshold
+
+    def _is_road(self, roi_bgr, x, y):
+        """Check if pixel (x,y) in the BGR mask is road (blue)."""
+        h, w = roi_bgr.shape[:2]
+        if x < 0 or x >= w or y < 0 or y >= h:
+            return False
+        b, g, r = int(roi_bgr[y, x, 0]), int(roi_bgr[y, x, 1]), int(roi_bgr[y, x, 2])
+        return b > 200 and g < 80 and r < 80  # CALIBRATE: road color threshold
+
+    def _road_ratio_at_x(self, roi_bgr, x, h):
+        """Sample vertical column at x, return fraction of points on road."""
+        n = self.validate_num_points
+        if n <= 0:
+            return 1.0
+        ys = np.linspace(int(h * 0.3), h - 2, n, dtype=int)  # CALIBRATE: sample from 30% to bottom
+        road_count = sum(1 for y in ys if self._is_road(roi_bgr, x, int(y)))
+        return road_count / n
+
+    def _project_to_road(self, roi_bgr, h, w, prefer_x=None):
+        """Fallback: find road centroid in bottom third of ROI.
+           Returns the x coordinate closest to prefer_x within road."""
+        # Sample the bottom third for road pixels
+        y_start = int(h * 0.65)  # CALIBRATE: bottom 35% of ROI
+        road_slice = roi_bgr[y_start:, :]
+        # Road is blue: B>200, G<80, R<80
+        road_mask = (road_slice[:, :, 0] > 200) & (road_slice[:, :, 1] < 80) & (road_slice[:, :, 2] < 80)
+        road_xs = np.where(road_mask.any(axis=0))[0]
+        if road_xs.size == 0:
+            return None
+        if prefer_x is not None:
+            # Return the road x closest to the preferred position
+            dists = np.abs(road_xs.astype(float) - float(prefer_x))
+            return int(road_xs[np.argmin(dists)])
+        # Otherwise return centroid of right half of road (drive on right)
+        mid = w // 2
+        right_road = road_xs[road_xs >= mid]
+        if right_road.size > 0:
+            return int(np.mean(right_road))
+        return int(np.mean(road_xs))
+
+    def _validate_and_fix_center(self, roi_bgr, lane_center_x, h, w,
+                                  yellow_cx, edge_cx, lane_width_px, offset_px):
+        """Validate that lane_center_x is on road, not sidewalk.
+           Returns (validated_x, status_string).
+           status_string: '' = ok, 'FLIP' = offset flipped, 'FALLBACK' = road projection."""
+        if lane_center_x is None or not self.sidewalk_validate:
+            return lane_center_x, ''
+
+        # --- Step 1: Check if current center is on road ---
+        ratio = self._road_ratio_at_x(roi_bgr, lane_center_x, h)
+        if ratio >= self.min_road_ratio:  # CALIBRATE: min_road_ratio
+            return lane_center_x, ''  # valid
+
+        # --- Step 2: Flip offset direction ---
+        # Determine base point and reverse the offset
+        flipped_x = None
+        if yellow_cx is not None and edge_cx is not None:
+            # Both visible: center was average, flip by shifting opposite to offset
+            flipped_x = int(clamp(
+                (yellow_cx + edge_cx) / 2.0 - offset_px, 0, w - 1))
+        elif edge_cx is not None:
+            # Edge only: was shifting left, now shift right
+            flipped_x = int(clamp(
+                edge_cx + 0.5 * lane_width_px + offset_px, 0, w - 1))
+        elif yellow_cx is not None:
+            # Yellow only: was shifting right, now shift left
+            flipped_x = int(clamp(
+                yellow_cx - 0.5 * lane_width_px - offset_px, 0, w - 1))
+
+        if flipped_x is not None:
+            flip_ratio = self._road_ratio_at_x(roi_bgr, flipped_x, h)
+            if flip_ratio >= self.min_road_ratio:
+                return flipped_x, 'FLIP'
+
+        # --- Step 3: Fallback to road projection ---
+        fallback_x = self._project_to_road(roi_bgr, h, w,
+                                            prefer_x=self.last_lane_center_x)
+        if fallback_x is not None:
+            return fallback_x, 'FALLBACK'
+
+        # Nothing worked, return original (better than nothing)
+        return lane_center_x, ''
 
     # ================================================================
     #  Main callback
@@ -315,12 +420,22 @@ class YellowLinePositionNode(Node):
             if yellow_poly is not None:
                 center_poly = (np.array(yellow_poly) + np.array(edge_poly)) / 2.0
             else:
+                # Edge only → shift left by half lane width
                 offset_poly = np.array(edge_poly).copy()
                 if self.lane_width_px is not None:
                     offset_poly[-1] -= 0.5 * float(self.lane_width_px)
                 else:
                     offset_poly[-1] -= 0.5 * self.default_lane_width_ratio * w
                 center_poly = offset_poly
+            poly_valid = True
+        elif yellow_poly is not None:
+            # Yellow only → shift right by half lane width (inverse)
+            offset_poly = np.array(yellow_poly).copy()
+            if self.lane_width_px is not None:
+                offset_poly[-1] += 0.5 * float(self.lane_width_px)
+            else:
+                offset_poly[-1] += 0.5 * self.default_lane_width_ratio * w
+            center_poly = offset_poly
             poly_valid = True
 
         # Extract curvature (raw)
@@ -383,7 +498,14 @@ class YellowLinePositionNode(Node):
                 if yellow_visible and yellow_cx is not None:
                     lane_center_x = int((yellow_cx + edge_cx) / 2.0)
                 else:
+                    # Edge only → shift left
                     lane_center_x = int(edge_cx - 0.5 * float(self.lane_width_px))
+                lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
+                self.last_lane_center_x = lane_center_x
+                self.center_has_value = True
+            elif yellow_visible and yellow_cx is not None:
+                # Yellow only → shift right (inverse)
+                lane_center_x = int(yellow_cx + 0.5 * float(self.lane_width_px))
                 lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
@@ -391,6 +513,26 @@ class YellowLinePositionNode(Node):
                 # HOLD
                 if self.last_lane_center_x is not None:
                     lane_center_x = self.last_lane_center_x
+
+        # ================== Sidewalk validation ==================
+        self.last_validation_status = ''
+        if lane_center_x is not None:
+            lane_center_x, self.last_validation_status = self._validate_and_fix_center(
+                roi, lane_center_x, h, w,
+                yellow_cx if yellow_visible else None,
+                edge_cx if edge_visible else None,
+                float(self.lane_width_px),
+                self.straight_offset_px if not in_curve else 0,
+            )
+
+        # Smooth lane_center_x with EMA to prevent jumps
+        if lane_center_x is not None:
+            if self.smoothed_center_x is None:
+                self.smoothed_center_x = float(lane_center_x)
+            else:
+                ca = self.center_ema_alpha
+                self.smoothed_center_x = (1.0 - ca) * self.smoothed_center_x + ca * float(lane_center_x)
+            lane_center_x = int(clamp(self.smoothed_center_x, 0, w - 1))
 
         # Error
         if lane_center_x is not None:
@@ -465,6 +607,11 @@ class YellowLinePositionNode(Node):
         cv2.putText(dbg,
                     f"MODO: {mode_str} | curv={curvature:.5f}",
                     (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_clr, 2)
+        if self.last_validation_status:
+            val_clr = (0, 165, 255) if self.last_validation_status == 'FLIP' else (0, 0, 255)
+            cv2.putText(dbg,
+                        f"!! {self.last_validation_status} !!",
+                        (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, val_clr, 2)
 
         cv2.imshow('lane_detection', dbg)
         key = cv2.waitKey(1) & 0xFF

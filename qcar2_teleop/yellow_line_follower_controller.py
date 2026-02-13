@@ -349,6 +349,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # Stop motors before shutting down
+        node.publish_motorcommands(0.0, 0.0)
+        node.get_logger().info("Motors stopped. Shutting down.")
         node.destroy_node()
         rclpy.shutdown()
 
