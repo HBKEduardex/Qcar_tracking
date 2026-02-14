@@ -2,7 +2,7 @@ yellow_line_follower_controller:
   ros__parameters:
     kp: 0.42105263157894735
     ki: 0.031578947368421054
-    kd: 0.16842105263157894
+    kd: 0.36842105263157894
     use_kalman: true
     kalman_q: 0.02
     kalman_r: 0.08

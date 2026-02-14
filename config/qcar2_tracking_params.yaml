@@ -1,0 +1,118 @@
+/**:
+  ros__parameters:
+    # Topicos compartidos
+    topics:
+      input_image: "/camera/csi_image_3"
+      mask: "/segmentation/color_mask"
+      yellow_error: "/lane/yellow/error"
+      yellow_visible: "/lane/yellow/visible"
+      center_error: "/lane/center/error"
+      center_visible: "/lane/center/visible"
+      curvature: "/lane/curvature"
+      motor_cmd: "/qcar2_motor_speed_cmd"
+
+color_segmentation_node:
+  ros__parameters:
+    input_image_topic: "/camera/csi_image_3"
+    output_mask_topic: "/segmentation/color_mask"
+    # Añadir otros parametros de segmentacion si existen en el nodo,
+    # por ahora el readme solo menciona estos topics.
+
+yellow_line_position_node:
+  ros__parameters:
+    mask_topic: "/segmentation/color_mask"
+    yellow_error_topic: "/lane/yellow/error"
+    yellow_visible_topic: "/lane/yellow/visible"
+    center_error_topic: "/lane/center/error"
+    center_visible_topic: "/lane/center/visible"
+    curvature_topic: "/lane/curvature"
+
+    # ROI
+    use_bottom_ratio: 0.25
+
+    # Thresholds
+    min_yellow_pixels: 120
+    min_edge_pixels: 60
+    min_edge_x_ratio: 0.35
+
+    # Debug
+    show_detection_window: false
+    show_prediction_window: true
+
+    # Lane width learning
+    default_lane_width_ratio: 0.40
+    lane_width_ema_alpha: 0.20
+    min_lane_width_ratio: 0.25
+    max_lane_width_ratio: 0.95
+
+    # Polynomial / Ackermann
+    num_sample_rows: 12
+    poly_degree: 2
+    lookahead_ratio: 0.4
+    ackermann_gain: 0.24
+    min_fit_points: 5
+    curvature_threshold: 0.009
+    edge_hold_frames: 15
+    edge_ema_alpha: 0.3
+    curvature_ema_alpha: 0.15
+    curve_exit_frames: 5
+    straight_offset_px: 20
+    center_ema_alpha: 0.4
+
+    # Sidewalk validation
+    sidewalk_validate: true
+    min_road_ratio: 0.6
+    validate_num_points: 8
+
+    # Triangle / anti-invasion
+    yellow_area_enter_ratio: 0.08
+    yellow_area_exit_ratio: 0.05
+    triangle_enter_frames: 3
+    triangle_exit_frames: 5
+    max_center_jump_px: 25
+    yellow_safety_margin_px: 30
+
+yellow_line_follower_controller:
+  ros__parameters:
+    error_topic: "/lane/center/error"
+    visible_topic: "/lane/center/visible"
+    curvature_topic: "/lane/curvature"
+    cmd_topic: "/qcar2_motor_speed_cmd"
+
+    # PID Esta en los archivos llamados pid en config
+    ##kp: 0.526
+    ##ki: 0.042
+    ##kd: 0.168
+    integral_limit: 0.8
+
+    # Limits / speed
+    max_angle: 0.45
+    base_speed: 0.35
+    min_speed: 0.15
+    max_speed: 0.30
+    slowdown_gain: 0.65
+    curve_slowdown_gain: 0.4
+
+    # Safety / rate
+    lost_timeout: 0.35
+    rate_hz: 20.0
+    max_steer_rate: 1.5
+    visible_hold_sec: 0.20
+    derivative_limit: 8.0
+
+    # Kalman Esta en los archivos llamados pid en config
+    #use_kalman: true
+    #kalman_q: 0.02
+    #kalman_r: 0.08
+    kalman_p0: 1.0
+
+    # Debug pubs
+    publish_debug: true
+
+controller_plotter:
+  ros__parameters:
+    error_topic: "/lane/center/error"
+    visible_topic: "/lane/center/visible"
+    cmd_topic: "/qcar2_motor_speed_cmd"
+    history_sec: 12.0
+    update_hz: 20.0
