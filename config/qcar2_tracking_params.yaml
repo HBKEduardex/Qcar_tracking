@@ -3,7 +3,7 @@
     # Topicos compartidos
     topics:
       input_image: "/camera/csi_image_3"
-      mask: "/segmentation/color_mask"
+      mask: "/lokita"
       yellow_error: "/lane/yellow/error"
       yellow_visible: "/lane/yellow/visible"
       center_error: "/lane/center/error"
@@ -14,13 +14,13 @@
 color_segmentation_node:
   ros__parameters:
     input_image_topic: "/camera/csi_image_3"
-    output_mask_topic: "/segmentation/color_mask"
+    output_mask_topic: "/lokita"
     # Añadir otros parametros de segmentacion si existen en el nodo,
     # por ahora el readme solo menciona estos topics.
 
 yellow_line_position_node:
   ros__parameters:
-    mask_topic: "/segmentation/color_mask"
+    mask_topic: "/lokita"
     yellow_error_topic: "/lane/yellow/error"
     yellow_visible_topic: "/lane/yellow/visible"
     center_error_topic: "/lane/center/error"
