@@ -88,6 +88,12 @@ class YellowLineFollowerController(Node):
         self.declare_parameter('visible_hold_sec', 0.20)    # hold si visible cae poco
         self.declare_parameter('derivative_limit', 8.0)     # limita derivada
 
+        # Right curve boost — curvas cerradas a la derecha
+        self.declare_parameter('right_curve_gain', 2.5)          # CALIBRATE: multiplier on PID output when steering RIGHT (>1 = more aggressive)
+        self.declare_parameter('right_steer_rate', 4.0)          # CALIBRATE: max steer rate for right turns (rad/s). Normal=1.5, higher=ramps faster
+        self.declare_parameter('right_curve_speed_scale', 0.45)  # CALIBRATE: speed multiplier during right turns [0.3-1.0]. Lower=slower
+        self.declare_parameter('right_curve_error_thresh', 0.05) # CALIBRATE: min |error| to activate right boost (lower=activates sooner)
+
         # Kalman
         self.declare_parameter('use_kalman', True)
         self.declare_parameter('kalman_q', 0.02)   # sube si responde lento
@@ -121,6 +127,11 @@ class YellowLineFollowerController(Node):
         self.max_steer_rate = float(self.get_parameter('max_steer_rate').value)
         self.visible_hold_sec = float(self.get_parameter('visible_hold_sec').value)
         self.derivative_limit = float(self.get_parameter('derivative_limit').value)
+
+        self.right_curve_gain = float(self.get_parameter('right_curve_gain').value)
+        self.right_steer_rate = float(self.get_parameter('right_steer_rate').value)
+        self.right_curve_speed_scale = float(self.get_parameter('right_curve_speed_scale').value)
+        self.right_curve_error_thresh = float(self.get_parameter('right_curve_error_thresh').value)
 
         self.use_kalman = bool(self.get_parameter('use_kalman').value)
         self.kalman_q = float(self.get_parameter('kalman_q').value)
@@ -203,6 +214,14 @@ class YellowLineFollowerController(Node):
                 self.visible_hold_sec = float(p.value)
             elif p.name == 'derivative_limit':
                 self.derivative_limit = float(p.value)
+            elif p.name == 'right_curve_gain':
+                self.right_curve_gain = float(p.value)
+            elif p.name == 'right_steer_rate':
+                self.right_steer_rate = float(p.value)
+            elif p.name == 'right_curve_speed_scale':
+                self.right_curve_speed_scale = float(p.value)
+            elif p.name == 'right_curve_error_thresh':
+                self.right_curve_error_thresh = float(p.value)
             elif p.name == 'use_kalman':
                 self.use_kalman = bool(p.value)
             elif p.name == 'kalman_q':
@@ -322,17 +341,31 @@ class YellowLineFollowerController(Node):
 
         steering_desired = clamp(-u, -self.max_angle, self.max_angle)
 
-        # Rate limiter
-        max_delta = abs(self.max_steer_rate) * dt
+        # ---- Right curve boost ----
+        # center_error > 0 → u > 0 → steering = -u < 0 = turning RIGHT
+        is_right_turn = (steering_desired < 0 and
+                         abs(ef) > self.right_curve_error_thresh)
+        if is_right_turn and self.right_curve_gain > 1.0:
+            # Amplify the PID output for right turns
+            boosted_u = u * self.right_curve_gain
+            steering_desired = clamp(-boosted_u, -self.max_angle, self.max_angle)
+
+        # Rate limiter (faster for right turns)
+        effective_rate = (self.right_steer_rate if is_right_turn
+                          else self.max_steer_rate)
+        max_delta = abs(effective_rate) * dt
         delta = clamp(steering_desired - self.prev_steering, -max_delta, max_delta)
         steering = clamp(self.prev_steering + delta, -self.max_angle, self.max_angle)
         self.prev_steering = steering
 
-        # Speed adaptativa (+ curvatura)
+        # Speed adaptativa (+ curvatura + right curve)
         curv_norm = clamp(abs(self.last_curvature) * 1000.0, 0.0, 1.0)  # normalizar
         curve_factor = 1.0 - self.curve_slowdown_gain * curv_norm
         curve_factor = clamp(curve_factor, 0.3, 1.0)
         speed = self.base_speed * curve_factor * (1.0 - self.slowdown_gain * abs(ef))
+        # Extra slowdown during right turns
+        if is_right_turn:
+            speed *= self.right_curve_speed_scale
         speed = clamp(speed, self.min_speed, self.max_speed)
 
         # Debug pubs

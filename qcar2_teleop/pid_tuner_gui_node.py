@@ -40,7 +40,12 @@ class PIDTunerGUI(Node):
         self.cli_set = self.create_client(SetParameters, self.set_srv_name)
 
         # --- Estado ---
-        self._last_sent = {'kp': None, 'ki': None, 'kd': None, 'use_kalman': None, 'kalman_q': None, 'kalman_r': None}
+        self._last_sent = {
+            'kp': None, 'ki': None, 'kd': None,
+            'use_kalman': None, 'kalman_q': None, 'kalman_r': None,
+            'right_curve_gain': None, 'right_steer_rate': None,
+            'right_curve_speed_scale': None, 'right_curve_error_thresh': None,
+        }
         self._dirty = False
         self._stop = False
 
@@ -49,7 +54,7 @@ class PIDTunerGUI(Node):
         # =========================
         self.root = tk.Tk()
         self.root.title("PID Tuner (ROS2) - QCar2")
-        self.root.geometry("540x450")
+        self.root.geometry("540x620")
 
         # ✅ Variables Tk DESPUÉS del root (y con master)
         self.gui_kp = tk.DoubleVar(master=self.root, value=1.2)
@@ -58,6 +63,12 @@ class PIDTunerGUI(Node):
         self.gui_use_kalman = tk.BooleanVar(master=self.root, value=True)
         self.gui_q = tk.DoubleVar(master=self.root, value=0.02)
         self.gui_r = tk.DoubleVar(master=self.root, value=0.08)
+
+        # Right curve boost
+        self.gui_rcg = tk.DoubleVar(master=self.root, value=2.5)
+        self.gui_rsr = tk.DoubleVar(master=self.root, value=4.0)
+        self.gui_rcss = tk.DoubleVar(master=self.root, value=0.45)
+        self.gui_rcet = tk.DoubleVar(master=self.root, value=0.05)
 
         # Construir GUI
         self._build_gui()
@@ -91,6 +102,13 @@ class PIDTunerGUI(Node):
         if self.enable_kalman_tuning:
             self._add_slider(frm, "Kalman q (process noise)", self.gui_q, 0.0001, 0.2)
             self._add_slider(frm, "Kalman r (measurement noise)", self.gui_r, 0.0001, 0.5)
+
+        ttk.Separator(frm).pack(fill=tk.X, pady=10)
+        ttk.Label(frm, text="Right Curve Boost", font=("Arial", 10, "bold")).pack(anchor="w")
+        self._add_slider(frm, "Gain (multiplicador)", self.gui_rcg, 1.0, 5.0)
+        self._add_slider(frm, "Steer rate (rad/s)", self.gui_rsr, 1.0, 8.0)
+        self._add_slider(frm, "Speed scale", self.gui_rcss, 0.1, 1.0)
+        self._add_slider(frm, "Error threshold", self.gui_rcet, 0.01, 0.3)
 
         ttk.Separator(frm).pack(fill=tk.X, pady=10)
 
@@ -181,6 +199,10 @@ class PIDTunerGUI(Node):
             self._make_param('use_kalman', desired['use_kalman']),
             self._make_param('kalman_q', desired['kalman_q']),
             self._make_param('kalman_r', desired['kalman_r']),
+            self._make_param('right_curve_gain', desired['right_curve_gain']),
+            self._make_param('right_steer_rate', desired['right_steer_rate']),
+            self._make_param('right_curve_speed_scale', desired['right_curve_speed_scale']),
+            self._make_param('right_curve_error_thresh', desired['right_curve_error_thresh']),
         ]
 
         fut = self.cli_set.call_async(req)
@@ -219,7 +241,9 @@ class PIDTunerGUI(Node):
     def _try_load_from_controller_async(self):
         def worker():
             self.status.config(text="Leyendo del controlador...", foreground="orange")
-            names = ['kp', 'ki', 'kd', 'use_kalman', 'kalman_q', 'kalman_r']
+            names = ['kp', 'ki', 'kd', 'use_kalman', 'kalman_q', 'kalman_r',
+                     'right_curve_gain', 'right_steer_rate',
+                     'right_curve_speed_scale', 'right_curve_error_thresh']
             vals = self._get_params(names)
             if not vals:
                 self.status.config(text="No pude leer (¿controlador corriendo? ¿nombre correcto?)", foreground="red")
@@ -231,6 +255,10 @@ class PIDTunerGUI(Node):
             self.gui_use_kalman.set(bool(vals.get('use_kalman', self.gui_use_kalman.get())))
             self.gui_q.set(float(vals.get('kalman_q', self.gui_q.get())))
             self.gui_r.set(float(vals.get('kalman_r', self.gui_r.get())))
+            self.gui_rcg.set(float(vals.get('right_curve_gain', self.gui_rcg.get())))
+            self.gui_rsr.set(float(vals.get('right_steer_rate', self.gui_rsr.get())))
+            self.gui_rcss.set(float(vals.get('right_curve_speed_scale', self.gui_rcss.get())))
+            self.gui_rcet.set(float(vals.get('right_curve_error_thresh', self.gui_rcet.get())))
 
             self._dirty = False
             self.status.config(text="Parámetros cargados del controlador", foreground="green")
@@ -248,7 +276,14 @@ class PIDTunerGUI(Node):
         q = float(self.gui_q.get())
         r = float(self.gui_r.get())
 
-        desired = {'kp': kp, 'ki': ki, 'kd': kd, 'use_kalman': use_k, 'kalman_q': q, 'kalman_r': r}
+        desired = {
+            'kp': kp, 'ki': ki, 'kd': kd,
+            'use_kalman': use_k, 'kalman_q': q, 'kalman_r': r,
+            'right_curve_gain': float(self.gui_rcg.get()),
+            'right_steer_rate': float(self.gui_rsr.get()),
+            'right_curve_speed_scale': float(self.gui_rcss.get()),
+            'right_curve_error_thresh': float(self.gui_rcet.get()),
+        }
 
         changed = force
         if not changed:
@@ -299,6 +334,10 @@ class PIDTunerGUI(Node):
             f"    use_kalman: {str(use_k).lower()}\n"
             f"    kalman_q: {q}\n"
             f"    kalman_r: {r}\n"
+            f"    right_curve_gain: {float(self.gui_rcg.get())}\n"
+            f"    right_steer_rate: {float(self.gui_rsr.get())}\n"
+            f"    right_curve_speed_scale: {float(self.gui_rcss.get())}\n"
+            f"    right_curve_error_thresh: {float(self.gui_rcet.get())}\n"
         )
 
         try:

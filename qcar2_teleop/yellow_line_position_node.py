@@ -162,6 +162,7 @@ class YellowLinePositionNode(Node):
         self.triangle_count = 0            # frames counter for triangle hysteresis
         self.triangle_active = False       # triangle mode active flag
         self.last_extra_status = ''        # 'TRIANGLE', 'YEL_RISK', 'RATE_LIM'
+        self.last_curve_direction = 'RECTA' # 'DERECHA', 'IZQUIERDA', 'RECTA'
 
         # ==================== ROS I/O ====================
         self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
@@ -475,12 +476,12 @@ class YellowLinePositionNode(Node):
                 center_poly = offset_poly
             poly_valid = True
         elif yellow_poly is not None:
-            # Yellow only → shift right by half lane width (inverse)
+            # Yellow only → shift right by 0.35 lane width (reduced — full 0.5 overshoots)
             offset_poly = np.array(yellow_poly).copy()
             if self.lane_width_px is not None:
-                offset_poly[-1] += 0.5 * float(self.lane_width_px)
+                offset_poly[-1] += 0.35 * float(self.lane_width_px)
             else:
-                offset_poly[-1] += 0.5 * self.default_lane_width_ratio * w
+                offset_poly[-1] += 0.35 * self.default_lane_width_ratio * w
             center_poly = offset_poly
             poly_valid = True
 
@@ -551,8 +552,8 @@ class YellowLinePositionNode(Node):
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
             elif yellow_for_center and yellow_cx_for_center is not None:
-                # Yellow only (not suppressed) → shift right (inverse)
-                lane_center_x = int(yellow_cx_for_center + 0.5 * float(self.lane_width_px))
+                # Yellow only (not suppressed) → shift right (reduced from 0.5)
+                lane_center_x = int(yellow_cx_for_center + 0.35 * float(self.lane_width_px))
                 lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
@@ -606,8 +607,37 @@ class YellowLinePositionNode(Node):
         if lane_center_x is not None:
             center_error = (lane_center_x - (w / 2.0)) / (w / 2.0)
             center_error = float(clamp(center_error, -1.0, 1.0))
+
+            # ---- Sidewalk error mirror ----
+            # If lane_center_x is on sidewalk, flip it across image center
+            if self.sidewalk_validate:
+                road_ratio = self._road_ratio_at_x(roi, lane_center_x, h)
+                if road_ratio < self.min_road_ratio:
+                    # Mirror: reflect across image center
+                    mirrored_x = int(clamp(w - 1 - lane_center_x, 0, w - 1))
+                    mirror_ratio = self._road_ratio_at_x(roi, mirrored_x, h)
+                    if mirror_ratio >= self.min_road_ratio:
+                        lane_center_x = mirrored_x
+                        center_error = (lane_center_x - (w / 2.0)) / (w / 2.0)
+                        center_error = float(clamp(center_error, -1.0, 1.0))
+                        self.last_validation_status = 'MIRROR'
+                    else:
+                        # Mirror also on sidewalk — project to road
+                        proj_x = self._project_to_road(roi, h, w,
+                                                       prefer_x=self.last_lane_center_x)
+                        if proj_x is not None:
+                            lane_center_x = proj_x
+                            center_error = (lane_center_x - (w / 2.0)) / (w / 2.0)
+                            center_error = float(clamp(center_error, -1.0, 1.0))
+                            self.last_validation_status = 'FALLBACK'
         else:
             center_error = 0.0
+
+        # Determine curve direction for debug
+        if abs(center_error) > 0.05:
+            self.last_curve_direction = 'DERECHA' if center_error > 0 else 'IZQUIERDA'
+        else:
+            self.last_curve_direction = 'RECTA'
 
         self.pub_c_vis.publish(Bool(data=self.center_has_value))
         self.pub_c_err.publish(Float32(data=center_error))
@@ -695,6 +725,20 @@ class YellowLinePositionNode(Node):
             cv2.putText(dbg,
                         f"!! {self.last_extra_status} !!",
                         (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, extra_clr, 2)
+            status_y += 25
+
+        # ---- Curve direction indicator (large, prominent) ----
+        if self.last_curve_direction == 'DERECHA':
+            dir_text = 'CURVA DERECHA  >>>'
+            dir_clr = (0, 200, 0)      # green
+        elif self.last_curve_direction == 'IZQUIERDA':
+            dir_text = '<<<  CURVA IZQUIERDA'
+            dir_clr = (255, 100, 0)    # blue
+        else:
+            dir_text = '--- RECTA ---'
+            dir_clr = (200, 200, 200)  # gray
+        cv2.putText(dbg, dir_text,
+                    (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.9, dir_clr, 3)
 
         cv2.imshow('lane_detection', dbg)
         key = cv2.waitKey(1) & 0xFF
