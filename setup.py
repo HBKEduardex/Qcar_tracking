@@ -30,6 +30,8 @@ setup(
             'yellow_line_follower_controller = qcar2_teleop.yellow_line_follower_controller:main',
             'pid_tuner_gui_node = qcar2_teleop.pid_tuner_gui_node:main',
             'controller_plotter_node = qcar2_teleop.controller_plotter_node:main',
+            'nav2_lane_bridge = qcar2_teleop.nav2_lane_bridge:main',
+            'bridge_monitor = qcar2_teleop.bridge_monitor_node:main',
         ],
     },
 )
