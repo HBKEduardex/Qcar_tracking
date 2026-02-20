@@ -110,6 +110,10 @@ class HybridController(Node):
         # ── Hybrid anti-local-minima parameters ──
         self.declare_parameter('hybrid_lane_speed_factor', 0.8) # Factor for lane speed in hybrid mode
         self.declare_parameter('hybrid_use_max_speed', True)    # True=use max(nav2,lane), False=use nav2 only
+        
+        # ── Hybrid steering blend parameters ──
+        self.declare_parameter('hybrid_nav2_steer_weight', 0.7)  # Weight for Nav2 steering in hybrid mode (0-1)
+        self.declare_parameter('hybrid_lane_steer_weight', 0.3)  # Weight for lane steering in hybrid mode (0-1)
 
         # Load params
         self.nav2_speed_scale = float(self.get_parameter('nav2_speed_scale').value)
@@ -142,6 +146,8 @@ class HybridController(Node):
         self.require_yellow_for_lane = bool(self.get_parameter('require_yellow_for_lane').value)
         self.hybrid_lane_speed_factor = float(self.get_parameter('hybrid_lane_speed_factor').value)
         self.hybrid_use_max_speed = bool(self.get_parameter('hybrid_use_max_speed').value)
+        self.hybrid_nav2_steer_weight = float(self.get_parameter('hybrid_nav2_steer_weight').value)
+        self.hybrid_lane_steer_weight = float(self.get_parameter('hybrid_lane_steer_weight').value)
         
         # Edge safety parameters
         self.edge_safety_enabled = bool(self.get_parameter('edge_safety_enabled').value)
@@ -464,9 +470,12 @@ class HybridController(Node):
 
         # ══════════════════════════════════════════════
         # STEERING decision
+        # 
+        # IMPORTANTE: Cuando hay un goal activo, Nav2 tiene prioridad
+        # para la dirección. Lane follower solo ayuda a mantenerse en carril.
         # ══════════════════════════════════════════════
         
-        # ── NAV2_FORCED: detección de carril insuficiente → confiar en Nav2 ──
+        # ── NAV2_FORCED: detección de carril insuficiente → confiar 100% en Nav2 ──
         if self.force_nav2:
             mode = MODE_NAV2_FORCED
             steering_desired = clamp(
@@ -476,7 +485,7 @@ class HybridController(Node):
             effective_rate = self.max_steer_rate
         
         elif self.in_nav2_turn:
-            # ── NAV2_TURN: Nav2 controls steering (intersection) ──
+            # ── NAV2_TURN: Nav2 controls steering (intersection/large turns) ──
             mode = MODE_NAV2_TURN
             steering_desired = clamp(
                 self.turn_steer_gain * self.nav2_angular_z,
@@ -485,13 +494,24 @@ class HybridController(Node):
             effective_rate = self.turn_max_steer_rate
 
         elif dt_steering < self.lost_timeout and self.lane_visible:
-            # ── LANE_PID: steering from lane follower MotorCommands (already in rad) ──
+            # ── HYBRID STEERING: Mezcla ponderada de Nav2 + lane follower ──
+            # Nav2 da la dirección principal hacia el goal
+            # Lane follower ayuda a mantenerse dentro del carril
             mode = MODE_LANE_PID
-            steering_desired = clamp(self.lane_steering, -self.max_angle, self.max_angle)
+            
+            nav2_steer = self.turn_steer_gain * self.nav2_angular_z
+            lane_steer = self.lane_steering
+            
+            # Mezcla ponderada: Nav2 tiene más peso para ir al goal
+            steering_desired = (
+                self.hybrid_nav2_steer_weight * nav2_steer +
+                self.hybrid_lane_steer_weight * lane_steer
+            )
+            steering_desired = clamp(steering_desired, -self.max_angle, self.max_angle)
             effective_rate = self.max_steer_rate
 
         else:
-            # ── FALLBACK: lane lost + no turn → use Nav2 angular.z gently ──
+            # ── FALLBACK: lane lost + no turn → use Nav2 angular.z ──
             mode = MODE_NAV2_TURN
             steering_desired = clamp(
                 self.turn_steer_gain * self.nav2_angular_z,
