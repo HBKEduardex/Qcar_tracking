@@ -87,9 +87,9 @@ yellow_line_follower_controller:
 
     # Limits
     max_angle: 0.45
-    base_speed: 0.35
+    base_speed: 0.25
     min_speed: 0.15
-    max_speed: 0.30
+    max_speed: 0.25
     slowdown_gain: 0.65
     curve_slowdown_gain: 0.4
 
@@ -126,7 +126,7 @@ hybrid_controller:
     lost_timeout: 0.5
 
     # Steering limits (rad) — debe coincidir con yellow_line_follower_controller
-    max_angle: 0.45
+    max_angle: 0.6
 
     # MotorCommands topic from lane follower
     lane_cmd_topic: "/lane/motor_cmd"
