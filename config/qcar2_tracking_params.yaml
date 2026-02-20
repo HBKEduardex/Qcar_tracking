@@ -26,9 +26,11 @@ yellow_line_position_node:
     center_error_topic: "/lane/center/error"
     center_visible_topic: "/lane/center/visible"
     curvature_topic: "/lane/curvature"
+    edge_count_topic: "/lane/edge/count"      # Número de bordes detectados (0, 1, 2)
+    edge_position_topic: "/lane/edge/position"  # Posición normalizada del borde rojo (-1 a 1)
 
     # ROI
-    use_bottom_ratio: 0.25
+    use_bottom_ratio: 0.35
 
     # Thresholds
     min_yellow_pixels: 120
@@ -137,6 +139,33 @@ hybrid_controller:
     turn_steer_gain: 1.0             # gain Nav2 angular.z → steering
     turn_speed_scale: 0.5            # reduce velocidad durante giros
     turn_max_steer_rate: 3.0         # rate limit más alto durante giros
+
+    # Exploration goal topics
+    exploration_goal_topic: "/exploration_goal"
+    nav2_goal_topic: "/goal_pose"
+
+    # Lane detection topics for forced Nav2
+    yellow_visible_topic: "/lane/yellow/visible"
+    edge_count_topic: "/lane/edge/count"
+
+    # Forced Nav2 parameters (when lane detection is poor)
+    nav2_forced_speed_scale: 0.7     # Reduce speed when forcing Nav2
+    nav2_forced_steer_gain: 0.8      # Steering gain when forcing Nav2
+    min_edges_for_lane: 2            # Min "edges" needed to trust lane follower (0,1,2)
+    require_yellow_for_lane: true    # Require yellow line visible for lane mode
+    
+    # Hybrid anti-local-minima parameters
+    # El robot Ackermann puede atascarse en mínimos locales cuando Nav2 no encuentra camino directo.
+    # Estos parámetros controlan cómo se mezclan las velocidades de Nav2 y lane follower.
+    hybrid_lane_speed_factor: 0.8    # Factor para velocidad del lane follower en modo híbrido
+    hybrid_use_max_speed: true       # true=max(nav2,lane), false=solo nav2
+    
+    # Edge safety parameters (evitar cruzar/chocar línea roja)
+    # Cuando Nav2 controla y hay solo 1 línea roja detectada, evitar cruzarla
+    edge_position_topic: "/lane/edge/position"  # Topic con posición normalizada del borde
+    edge_safety_enabled: true        # Habilitar prevención de cruce de línea roja
+    edge_safety_threshold: 0.6       # Posición del borde para activar (0-1, mayor = más cerca del borde)
+    edge_safety_steer_limit: 0.3     # Máximo steering permitido hacia la línea (rad, ~17°)
 
 controller_plotter:
   ros__parameters:

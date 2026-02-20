@@ -58,6 +58,8 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('center_error_topic', '/lane/center/error')
         self.declare_parameter('center_visible_topic', '/lane/center/visible')
         self.declare_parameter('curvature_topic', '/lane/curvature')
+        self.declare_parameter('edge_count_topic', '/lane/edge/count')
+        self.declare_parameter('edge_position_topic', '/lane/edge/position')  # Posición normalizada del borde
 
         # ==================== ROI ====================
         self.declare_parameter('use_bottom_ratio', 0.45)
@@ -111,6 +113,8 @@ class YellowLinePositionNode(Node):
         self.center_error_topic = self.get_parameter('center_error_topic').value
         self.center_visible_topic = self.get_parameter('center_visible_topic').value
         self.curvature_topic = self.get_parameter('curvature_topic').value
+        self.edge_count_topic = self.get_parameter('edge_count_topic').value
+        self.edge_position_topic = self.get_parameter('edge_position_topic').value
 
         self.use_bottom_ratio = float(self.get_parameter('use_bottom_ratio').value)
         self.min_yellow_pixels = int(self.get_parameter('min_yellow_pixels').value)
@@ -170,6 +174,8 @@ class YellowLinePositionNode(Node):
         self.pub_c_err = self.create_publisher(Float32, self.center_error_topic, 10)
         self.pub_c_vis = self.create_publisher(Bool, self.center_visible_topic, 10)
         self.pub_curv = self.create_publisher(Float32, self.curvature_topic, 10)
+        self.pub_edge_count = self.create_publisher(Float32, self.edge_count_topic, 10)
+        self.pub_edge_position = self.create_publisher(Float32, self.edge_position_topic, 10)
 
         if self.show_detection_window:
             cv2.namedWindow('lane_detection', cv2.WINDOW_NORMAL)
@@ -611,6 +617,30 @@ class YellowLinePositionNode(Node):
 
         self.pub_c_vis.publish(Bool(data=self.center_has_value))
         self.pub_c_err.publish(Float32(data=center_error))
+
+        # Publicar edge_count para hybrid_controller (forced Nav2 logic)
+        # edge_count representa la "calidad" de detección:
+        #   0 = nada detectado (todo negro)
+        #   1 = solo un elemento (edge OR yellow, pero no ambos)
+        #   2 = detección completa (edge AND yellow, o equivalente)
+        if yellow_visible and edge_visible:
+            edge_count = 2.0  # Detección completa
+        elif yellow_visible or edge_visible:
+            edge_count = 1.0  # Solo un elemento
+        else:
+            edge_count = 0.0  # Nada detectado
+        self.pub_edge_count.publish(Float32(data=edge_count))
+        
+        # Publicar posición normalizada del borde rojo para seguridad en Nav2
+        # Valor entre -1.0 (izquierda) y +1.0 (derecha), 0.0 = centro
+        # Si no hay borde detectado, publicar 999.0 (sin datos)
+        if edge_visible and edge_cx is not None:
+            # edge_cx está en píxeles, normalizar a [-1, 1]
+            edge_position_norm = (edge_cx - (w / 2.0)) / (w / 2.0)
+            edge_position_norm = float(clamp(edge_position_norm, -1.0, 1.0))
+        else:
+            edge_position_norm = 999.0  # Valor especial: sin detección
+        self.pub_edge_position.publish(Float32(data=edge_position_norm))
 
         # ================== 6) Debug windows ==================
         if self.show_detection_window:
