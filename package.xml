@@ -9,9 +9,17 @@
 
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>cv_bridge</depend>
+  <depend>nav2_common</depend>
+  <depend>nav2_bringup</depend>
+  <depend>nav2_amcl</depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>qcar2_laneseg_acc</exec_depend>
   <exec_depend>qcar2_interfaces</exec_depend>
+  <exec_depend>qcar2_nodes</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -43,11 +43,14 @@ class YellowLineFollowerController(Node):
       - error = /lane/center/error (Float32, [-1,+1])
       - curvature = /lane/curvature (Float32) → frena más en curvas
 
-    Publica MotorCommands (manteniendo tu convención):
-      msg.motor_names = ['motor_throttle', 'steering_angle']
-      msg.values      = [steering_angle, motor_throttle]
+    Publica MotorCommands normalizado según qcar2_interfaces.msg:
+      /lane/motor_cmd (MotorCommands) — para hybrid_controller
+        msg.motor_names = ['steering_angle', 'motor_throttle']
+        msg.values      = [steering_rad, speed_ms]
 
-    Además publica debug (para el nodo de gráficas):
+      /qcar2_motor_speed_cmd (MotorCommands) — directo al motor (si publish_motor_cmd=true)
+
+    Debug topics:
       /controller/error_raw   (Float32)
       /controller/error_filt  (Float32)
       /controller/u_raw       (Float32)
@@ -97,6 +100,11 @@ class YellowLineFollowerController(Node):
         # Debug pubs
         self.declare_parameter('publish_debug', True)
 
+        # Inter-node MotorCommands (para hybrid_controller)
+        self.declare_parameter('publish_motor_cmd', False)
+        self.declare_parameter('lane_cmd_topic', '/lane/motor_cmd')
+        self.declare_parameter('send_speed_in_motor_cmd', True)  # Si false, solo envía steering
+
         # Load params
         self.error_topic = self.get_parameter('error_topic').value
         self.visible_topic = self.get_parameter('visible_topic').value
@@ -129,6 +137,11 @@ class YellowLineFollowerController(Node):
 
         self.publish_debug = bool(self.get_parameter('publish_debug').value)
 
+        # Inter-node communication
+        self.publish_motor_cmd = bool(self.get_parameter('publish_motor_cmd').value)
+        self.lane_cmd_topic = self.get_parameter('lane_cmd_topic').value
+        self.send_speed_in_motor_cmd = bool(self.get_parameter('send_speed_in_motor_cmd').value)
+
         # State
         self.last_error = 0.0
         self.last_curvature = 0.0
@@ -152,6 +165,9 @@ class YellowLineFollowerController(Node):
         self.sub_curv = self.create_subscription(Float32, self.curvature_topic, self.cb_curvature, 10)
         self.pub_cmd = self.create_publisher(MotorCommands, self.cmd_topic, 10)
 
+        # Publisher: MotorCommands normalizado para hybrid_controller
+        self.pub_lane_cmd = self.create_publisher(MotorCommands, self.lane_cmd_topic, 10)
+
         # Debug publishers
         if self.publish_debug:
             self.pub_error_raw = self.create_publisher(Float32, '/controller/error_raw', 10)
@@ -171,8 +187,11 @@ class YellowLineFollowerController(Node):
         self.get_logger().info(f"  visible_topic  : {self.visible_topic}")
         self.get_logger().info(f"  curvature_topic: {self.curvature_topic}")
         self.get_logger().info(f"  cmd_topic      : {self.cmd_topic}")
+        self.get_logger().info(f"  lane_cmd_topic : {self.lane_cmd_topic} (MotorCommands)")
+        self.get_logger().info(f"  send_speed_in_motor_cmd={self.send_speed_in_motor_cmd}")
         self.get_logger().info(f"  curve_slowdown_gain={self.curve_slowdown_gain}")
         self.get_logger().info(f"  use_kalman={self.use_kalman} (q={self.kalman_q}, r={self.kalman_r})")
+        self.get_logger().info(f"  publish_motor_cmd={self.publish_motor_cmd}")
 
     # ============ Live parameter updates ============
     def _on_params_change(self, params):
@@ -208,6 +227,10 @@ class YellowLineFollowerController(Node):
             elif p.name == 'kalman_q':
                 self.kalman_q = float(p.value)
                 self.kf.q = self.kalman_q
+            elif p.name == 'publish_motor_cmd':
+                self.publish_motor_cmd = bool(p.value)
+            elif p.name == 'send_speed_in_motor_cmd':
+                self.send_speed_in_motor_cmd = bool(p.value)
             elif p.name == 'kalman_r':
                 self.kalman_r = float(p.value)
                 self.kf.r = self.kalman_r
@@ -228,8 +251,10 @@ class YellowLineFollowerController(Node):
 
     def publish_motorcommands(self, steering_angle: float, motor_throttle: float):
         msg = MotorCommands()
-        # Mantengo tu convención para no romper tu sistema actual:
-        msg.motor_names = ['motor_throttle', 'steering_angle']
+        # MotorCommands expects:
+        #   steering_angle in radians (rad)
+        #   motor_throttle in m/s
+        msg.motor_names = ['steering_angle', 'motor_throttle']
         msg.values = [float(steering_angle), float(motor_throttle)]
         self.pub_cmd.publish(msg)
 
@@ -335,10 +360,24 @@ class YellowLineFollowerController(Node):
         speed = self.base_speed * curve_factor * (1.0 - self.slowdown_gain * abs(ef))
         speed = clamp(speed, self.min_speed, self.max_speed)
 
+        # ALWAYS publish MotorCommands normalizado en /lane/motor_cmd
+        # (para hybrid_controller: steering_angle in rad, motor_throttle in m/s)
+        lane_msg = MotorCommands()
+        if self.send_speed_in_motor_cmd:
+            lane_msg.motor_names = ['steering_angle', 'motor_throttle']
+            lane_msg.values = [float(steering), float(speed)]
+        else:
+            # Solo steering — hybrid_controller usará Nav2 speed o base_autonomous_speed
+            lane_msg.motor_names = ['steering_angle']
+            lane_msg.values = [float(steering)]
+        self.pub_lane_cmd.publish(lane_msg)
+
+        # Opcionalmente publica directo al motor (modo standalone)
+        if self.publish_motor_cmd:
+            self.publish_motorcommands(steering, speed)
+
         # Debug pubs
         self._pub_debug(z=z, ef=ef, u_raw=u, steering=steering, speed=speed)
-
-        self.publish_motorcommands(steering, speed)
 
 
 def main(args=None):

@@ -94,10 +94,12 @@ class ControllerPlotter(Node):
         self.last_vis = bool(msg.data)
 
     def cb_cmd(self, msg: MotorCommands):
-        # OJO: tu controlador publica values = [steering, speed]
-        if len(msg.values) >= 2:
-            self.last_steer = float(msg.values[0])
-            self.last_speed = float(msg.values[1])
+        # Parse MotorCommands by name (robust to order changes)
+        for i, name in enumerate(msg.motor_names):
+            if name == 'steering_angle' and i < len(msg.values):
+                self.last_steer = float(msg.values[i])
+            elif name == 'motor_throttle' and i < len(msg.values):
+                self.last_speed = float(msg.values[i])
 
     def sample_tick(self):
         now = time.time() - self.start_time

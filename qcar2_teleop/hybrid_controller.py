@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-Nav2 ↔ Lane Following Bridge Node  (v2 — intersection detection)
+Hybrid Nav2 ↔ Lane Following Controller (v3 — MotorCommands interface)
 
-Hybrid controller with 3 modes:
-  1. LANE_PID   (mode=1.0) — lane visible + Nav2 doesn't want sharp turn → PID steering
-  2. NAV2_TURN  (mode=0.0) — Nav2 angular.z exceeds threshold → Nav2 controls steering
-                             (intersection detected, robot turns toward goal)
-  3. STOPPED    (mode=-1)  — no Nav2 commands or Nav2 says stop
+Architecture:
+  - Receives MotorCommands from yellow_line_follower_controller via /lane/motor_cmd
+    (steering_angle in rad, motor_throttle in m/s — normalizado per qcar2_interfaces)
+  - Receives cmd_vel from Nav2 via /cmd_vel_nav
+  - Detects intersections (high angular.z) and switches modes
+  - Publishes MotorCommands to /qcar2_motor_speed_cmd
 
-Intersection logic:
-  - When |angular.z| > turn_enter_thresh  → enter NAV2_TURN
-  - Stay in NAV2_TURN until |angular.z| < turn_exit_thresh  (hysteresis)
-  - In NAV2_TURN the robot uses Nav2's angular.z for steering direction
-  - Speed is reduced during turns (turn_speed_scale)
+Modes:
+  1. LANE_PID   (mode=1.0) — steering+speed from lane follower MotorCommands
+  2. NAV2_TURN  (mode=0.0) — steering from Nav2 angular.z (intersection) + reduced speed
+  3. STOPPED    (mode=-1)  — no commands or Nav2 says stop
 
 Subscribes:
-  /cmd_vel_nav           (geometry_msgs/Twist)   — Nav2 velocity command
-  /lane/center/error     (std_msgs/Float32)      — lane error [-1, +1]
-  /lane/center/visible   (std_msgs/Bool)         — lane detected?
-  /lane/curvature        (std_msgs/Float32)      — lane curvature
+  /cmd_vel_nav       (geometry_msgs/Twist)            — Nav2 velocity command
+  /lane/motor_cmd    (qcar2_interfaces/MotorCommands)  — steering+speed from lane follower
+  /lane/center/visible (std_msgs/Bool)                — lane detected?
+  /lane/curvature    (std_msgs/Float32)               — lane curvature (optional)
 
 Publishes:
-  /qcar2_motor_speed_cmd (qcar2_interfaces/MotorCommands) — motor commands
-  /bridge/steering       (std_msgs/Float32)      — debug: current steering
-  /bridge/speed          (std_msgs/Float32)      — debug: current speed
-  /bridge/mode           (std_msgs/Float32)      — debug: 1.0=lane, 0.0=nav2_turn, -1.0=stopped
+  /qcar2_motor_speed_cmd (qcar2_interfaces/MotorCommands) — final motor commands
+  /hybrid/steering       (std_msgs/Float32)      — debug: current steering (rad)
+  /hybrid/speed          (std_msgs/Float32)      — debug: current speed (m/s)
+  /hybrid/mode           (std_msgs/Float32)      — debug: 1.0=lane, 0.0=nav2_turn, -1.0=stopped
 """
 
 import rclpy
@@ -46,20 +46,14 @@ MODE_NAV2_TURN =  0.0
 MODE_LANE_PID  =  1.0
 
 
-class Nav2LaneBridge(Node):
+class HybridController(Node):
     def __init__(self):
-        super().__init__('nav2_lane_bridge')
+        super().__init__('hybrid_controller')
 
         # ─── Parameters ───
-        # PID for lane steering
-        self.declare_parameter('kp', 0.42)
-        self.declare_parameter('ki', 0.03)
-        self.declare_parameter('kd', 0.17)
-        self.declare_parameter('integral_limit', 0.8)
-        self.declare_parameter('max_angle', 0.45)
-
-        # Hybrid blending
+        # Speed control
         self.declare_parameter('nav2_speed_scale', 1.0)
+        self.declare_parameter('base_autonomous_speed', 0.25)  # if no Nav2 speed
         self.declare_parameter('curve_slowdown_gain', 0.5)
         self.declare_parameter('error_slowdown_gain', 0.3)
         self.declare_parameter('min_speed', 0.05)
@@ -67,6 +61,8 @@ class Nav2LaneBridge(Node):
         self.declare_parameter('max_steer_rate', 1.5)
         self.declare_parameter('rate_hz', 50.0)
         self.declare_parameter('lost_timeout', 0.5)
+        self.declare_parameter('max_angle', 0.45)            # max steering angle (rad)
+        self.declare_parameter('lane_cmd_topic', '/lane/motor_cmd')  # MotorCommands from lane follower
 
         # ── Intersection turn detection ──
         self.declare_parameter('turn_enter_thresh', 0.4)     # |angular.z| to enter NAV2_TURN (rad/s)
@@ -76,12 +72,8 @@ class Nav2LaneBridge(Node):
         self.declare_parameter('turn_max_steer_rate', 3.0)   # faster rate limit during turns
 
         # Load params
-        self.kp = float(self.get_parameter('kp').value)
-        self.ki = float(self.get_parameter('ki').value)
-        self.kd = float(self.get_parameter('kd').value)
-        self.integral_limit = float(self.get_parameter('integral_limit').value)
-        self.max_angle = float(self.get_parameter('max_angle').value)
         self.nav2_speed_scale = float(self.get_parameter('nav2_speed_scale').value)
+        self.base_autonomous_speed = float(self.get_parameter('base_autonomous_speed').value)
         self.curve_slowdown_gain = float(self.get_parameter('curve_slowdown_gain').value)
         self.error_slowdown_gain = float(self.get_parameter('error_slowdown_gain').value)
         self.min_speed = float(self.get_parameter('min_speed').value)
@@ -89,6 +81,8 @@ class Nav2LaneBridge(Node):
         self.max_steer_rate = float(self.get_parameter('max_steer_rate').value)
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.lost_timeout = float(self.get_parameter('lost_timeout').value)
+        self.max_angle = float(self.get_parameter('max_angle').value)
+        self.lane_cmd_topic = self.get_parameter('lane_cmd_topic').value
 
         self.turn_enter_thresh = float(self.get_parameter('turn_enter_thresh').value)
         self.turn_exit_thresh = float(self.get_parameter('turn_exit_thresh').value)
@@ -97,27 +91,24 @@ class Nav2LaneBridge(Node):
         self.turn_max_steer_rate = float(self.get_parameter('turn_max_steer_rate').value)
 
         # ─── State ───
-        self.lane_error = 0.0
+        self.lane_steering = 0.0          # from lane follower MotorCommands (rad)
+        self.lane_speed = 0.0             # from lane follower MotorCommands (m/s)
+        self.prev_steering = 0.0          # for rate limiter
         self.lane_visible = False
         self.lane_curvature = 0.0
         self.nav2_linear_x = 0.0
         self.nav2_angular_z = 0.0
         self.last_nav2_time = self.get_clock().now()
-
-        # PID state
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.prev_steering = 0.0
-        self.prev_time = self.get_clock().now()
+        self.last_steering_time = self.get_clock().now()
 
         # Turn state machine
-        self.in_nav2_turn = False  # True = Nav2 controls steering (intersection)
+        self.in_nav2_turn = False
 
         # ─── Subs ───
         self.sub_cmd_vel = self.create_subscription(
             Twist, '/cmd_vel_nav', self.cb_cmd_vel, 10)
-        self.sub_lane_error = self.create_subscription(
-            Float32, '/lane/center/error', self.cb_lane_error, 10)
+        self.sub_lane_cmd = self.create_subscription(
+            MotorCommands, self.lane_cmd_topic, self.cb_lane_cmd, 10)
         self.sub_lane_visible = self.create_subscription(
             Bool, '/lane/center/visible', self.cb_lane_visible, 10)
         self.sub_curvature = self.create_subscription(
@@ -127,9 +118,9 @@ class Nav2LaneBridge(Node):
         self.pub_cmd = self.create_publisher(MotorCommands, '/qcar2_motor_speed_cmd', 10)
 
         # Debug pubs
-        self.pub_bridge_steer = self.create_publisher(Float32, '/bridge/steering', 10)
-        self.pub_bridge_speed = self.create_publisher(Float32, '/bridge/speed', 10)
-        self.pub_bridge_mode = self.create_publisher(Float32, '/bridge/mode', 10)
+        self.pub_hybrid_steer = self.create_publisher(Float32, '/hybrid/steering', 10)
+        self.pub_hybrid_speed = self.create_publisher(Float32, '/hybrid/speed', 10)
+        self.pub_hybrid_mode = self.create_publisher(Float32, '/hybrid/mode', 10)
 
         # ─── Timer ───
         period = 1.0 / max(1.0, self.rate_hz)
@@ -138,7 +129,12 @@ class Nav2LaneBridge(Node):
         # ─── Param callback ───
         self.add_on_set_parameters_callback(self._on_params_change)
 
-        self.get_logger().info('Nav2LaneBridge v2 started — intersection turn detection enabled')
+        self.get_logger().info('HybridController v3 started (MotorCommands interface)')
+        self.get_logger().info(f'  Subscribes to {self.lane_cmd_topic} (MotorCommands from lane follower)')
+        self.get_logger().info(f'  Subscribes to /cmd_vel_nav (Nav2 velocity)')
+        self.get_logger().info(f'  max_angle={self.max_angle} rad')
+        self.get_logger().info(f'  base_autonomous_speed={self.base_autonomous_speed} (fallback)')
+        self.get_logger().info(f'  Publishes to /qcar2_motor_speed_cmd (MotorCommands)')
 
     # ─── Callbacks ───
     def cb_cmd_vel(self, msg: Twist):
@@ -146,8 +142,14 @@ class Nav2LaneBridge(Node):
         self.nav2_angular_z = msg.angular.z
         self.last_nav2_time = self.get_clock().now()
 
-    def cb_lane_error(self, msg: Float32):
-        self.lane_error = msg.data
+    def cb_lane_cmd(self, msg: MotorCommands):
+        """Parse MotorCommands normalizado: steering_angle (rad), motor_throttle (m/s)."""
+        for i, name in enumerate(msg.motor_names):
+            if name == 'steering_angle' and i < len(msg.values):
+                self.lane_steering = msg.values[i]
+            elif name == 'motor_throttle' and i < len(msg.values):
+                self.lane_speed = msg.values[i]
+        self.last_steering_time = self.get_clock().now()
 
     def cb_lane_visible(self, msg: Bool):
         self.lane_visible = msg.data
@@ -159,7 +161,10 @@ class Nav2LaneBridge(Node):
     def _on_params_change(self, params):
         for p in params:
             if hasattr(self, p.name):
-                setattr(self, p.name, float(p.value))
+                try:
+                    setattr(self, p.name, float(p.value) if p.name != 'rate_hz' else float(p.value))
+                except (ValueError, TypeError):
+                    pass
         return SetParametersResult(successful=True)
 
     # ─── Turn state machine ───
@@ -171,47 +176,41 @@ class Nav2LaneBridge(Node):
             # Enter NAV2_TURN when angular.z is large (intersection)
             if az > self.turn_enter_thresh:
                 self.in_nav2_turn = True
-                self._reset_pid()
                 self.get_logger().info(
-                    f'>>> INTERSECTION TURN — Nav2 angular.z={self.nav2_angular_z:+.3f} '
-                    f'(thresh={self.turn_enter_thresh:.2f})')
+                    f'>>> INTERSECTION DETECTED — Nav2 angular.z={self.nav2_angular_z:+.3f} '
+                    f'(enter_thresh={self.turn_enter_thresh:.2f})')
         else:
             # Exit NAV2_TURN when angular.z drops (turn completed)
             if az < self.turn_exit_thresh:
                 self.in_nav2_turn = False
-                self._reset_pid()
                 self.get_logger().info(
-                    f'<<< TURN COMPLETE — back to LANE PID '
+                    f'<<< TURN COMPLETE — back to LANE steering '
                     f'(angular.z={self.nav2_angular_z:+.3f})')
 
     # ─── Main control loop ───
     def control_loop(self):
         now = self.get_clock().now()
         dt_nav2 = (now - self.last_nav2_time).nanoseconds * 1e-9
+        dt_steering = (now - self.last_steering_time).nanoseconds * 1e-9
 
-        # ── STOPPED: no Nav2 data ──
+        # ── STOPPED: no Nav2 data for too long ──
         if dt_nav2 > self.lost_timeout:
             self._publish_motor(0.0, 0.0)
             self._pub_debug(0.0, 0.0, MODE_STOPPED)
             self.in_nav2_turn = False
+            self.prev_steering = 0.0
             return
 
         # ── STOPPED: Nav2 says stop (goal reached or no goal) ──
         if abs(self.nav2_linear_x) < 0.001:
             self._publish_motor(0.0, 0.0)
             self._pub_debug(0.0, 0.0, MODE_STOPPED)
-            self._reset_pid()
             self.in_nav2_turn = False
+            self.prev_steering = 0.0
             return
 
         # ── Update turn state machine ──
         self._update_turn_state()
-
-        # ── Compute dt ──
-        dt = (now - self.prev_time).nanoseconds * 1e-9
-        if dt <= 1e-6:
-            dt = 1.0 / self.rate_hz
-        self.prev_time = now
 
         # ══════════════════════════════════════════════
         # STEERING decision
@@ -219,28 +218,16 @@ class Nav2LaneBridge(Node):
         if self.in_nav2_turn:
             # ── NAV2_TURN: Nav2 controls steering (intersection) ──
             mode = MODE_NAV2_TURN
-            # Nav2 angular.z > 0 → turn left, < 0 → turn right
-            # Map to steering: positive angular.z → positive steering (left)
             steering_desired = clamp(
                 self.turn_steer_gain * self.nav2_angular_z,
                 -self.max_angle, self.max_angle
             )
             effective_rate = self.turn_max_steer_rate
 
-        elif self.lane_visible:
-            # ── LANE_PID: lane following controls steering ──
+        elif dt_steering < self.lost_timeout and self.lane_visible:
+            # ── LANE_PID: steering from lane follower MotorCommands (already in rad) ──
             mode = MODE_LANE_PID
-            ef = clamp(self.lane_error, -1.0, 1.0)
-
-            derivative = (ef - self.prev_error) / dt
-            derivative = clamp(derivative, -8.0, 8.0)
-            self.prev_error = ef
-
-            self.integral += ef * dt
-            self.integral = clamp(self.integral, -self.integral_limit, self.integral_limit)
-
-            u = self.kp * ef + self.ki * self.integral + self.kd * derivative
-            steering_desired = clamp(-u, -self.max_angle, self.max_angle)
+            steering_desired = clamp(self.lane_steering, -self.max_angle, self.max_angle)
             effective_rate = self.max_steer_rate
 
         else:
@@ -251,28 +238,36 @@ class Nav2LaneBridge(Node):
                 -self.max_angle, self.max_angle
             )
             effective_rate = self.max_steer_rate
-            self._reset_pid()
 
-        # Rate limiter
+        # Rate limiter on steering (smooth transitions)
+        dt = 1.0 / max(1.0, self.rate_hz)
         max_delta = effective_rate * dt
         delta = clamp(steering_desired - self.prev_steering, -max_delta, max_delta)
         steering = clamp(self.prev_steering + delta, -self.max_angle, self.max_angle)
         self.prev_steering = steering
 
         # ══════════════════════════════════════════════
-        # SPEED decision
-        # ══════════════════════════════════════════════
-        base_speed = abs(self.nav2_linear_x) * self.nav2_speed_scale
+        # SPEED decision (prioridad: Nav2 > lane_follower > base_autonomous)
+        # ════════════════════════════════════════════
+        # Prioridad 1: Nav2 proporciona velocidad
+        if abs(self.nav2_linear_x) > 0.001:
+            base_speed = abs(self.nav2_linear_x) * self.nav2_speed_scale
+        # Prioridad 2: lane_follower envió velocidad en MotorCommands (send_speed_in_motor_cmd=true)
+        elif abs(self.lane_speed) > 0.001 and self.lane_visible:
+            base_speed = abs(self.lane_speed)
+        # Prioridad 3: usar velocidad autónoma base si lane es visible
+        elif self.lane_visible:
+            base_speed = self.base_autonomous_speed
+        # Sin lane visible y sin Nav2 → parar
+        else:
+            base_speed = 0.0
 
-        # Curve/error slowdown
+        # Curve/error slowdown (even if using Nav2 speed)
         curv_norm = clamp(abs(self.lane_curvature) * 1000.0, 0.0, 1.0)
         curve_factor = 1.0 - self.curve_slowdown_gain * curv_norm
         curve_factor = clamp(curve_factor, 0.3, 1.0)
-
-        error_factor = 1.0 - self.error_slowdown_gain * abs(self.lane_error)
-        error_factor = clamp(error_factor, 0.5, 1.0)
-
-        speed = base_speed * curve_factor * error_factor
+        
+        speed = base_speed * curve_factor
 
         # Extra slowdown during turns
         if self.in_nav2_turn:
@@ -302,18 +297,14 @@ class Nav2LaneBridge(Node):
         self.pub_cmd.publish(msg)
 
     def _pub_debug(self, steering, speed, mode):
-        self.pub_bridge_steer.publish(Float32(data=float(steering)))
-        self.pub_bridge_speed.publish(Float32(data=float(speed)))
-        self.pub_bridge_mode.publish(Float32(data=float(mode)))
-
-    def _reset_pid(self):
-        self.integral = 0.0
-        self.prev_error = 0.0
+        self.pub_hybrid_steer.publish(Float32(data=float(steering)))
+        self.pub_hybrid_speed.publish(Float32(data=float(speed)))
+        self.pub_hybrid_mode.publish(Float32(data=float(mode)))
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = Nav2LaneBridge()
+    node = HybridController()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

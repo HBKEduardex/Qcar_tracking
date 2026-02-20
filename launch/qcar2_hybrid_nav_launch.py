@@ -4,17 +4,26 @@ Hybrid Nav2 + Lane Following Launch File (Combined)
 Brings up:
   1. Nav2 stack (planner, controller, bt_navigator) — for path planning & RViz goals
   2. AMCL (localization)
-  3. Lane following pipeline: color_segmentation + yellow_line_position
-  4. (Optional) nav2_lane_bridge for hybrid control
+  3. Lane following pipeline:
+     - color_segmentation_node → /lokita (mask)
+     - yellow_line_position_node → /lane/center/error, /lane/center/visible, /lane/curvature
+     - yellow_line_follower_controller → /lane/motor_cmd (MotorCommands: steering + speed)
+  4. (Optional) hybrid_controller: fuses lane steering with Nav2 velocity
 
 Note:
   - Cartographer SLAM is already running from qcar2_LaneMapping-ACC (NOT launched here)
   - qcar2_to_lidar_tf is already running from qcar2_LaneMapping-ACC cartographer_mapping.launch
   - cartographer_occupancy_grid_node is already running from qcar2_LaneMapping-ACC
   - QCar2 hardware/virtual setup should be running separately (qcar2_nodex/qcar2_virtual_launch.py)
-  - NO nav2_qcar2_converter → Nav2 plans routes but does NOT send motor commands
-  - Lane following runs in parallel for visual lane detection
-  - Bridge node fuses Nav2 velocity with lane-following steering
+
+Data flow:
+  camera → color_segmentation → yellow_line_position → yellow_line_follower_controller
+                                                              ↓
+                                                     /lane/motor_cmd (MotorCommands)
+                                                              ↓
+                                                     hybrid_controller (if enabled)
+                                                              ↓
+                                                     /qcar2_motor_speed_cmd → motor
 
 Usage:
   ros2 launch qcar2_teleop qcar2_hybrid_nav_launch.py
@@ -54,6 +63,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
     enable_bridge = LaunchConfiguration('enable_bridge')
+    enable_plotter = LaunchConfiguration('enable_plotter')
     config_file = LaunchConfiguration('config_file')
     config_file_pid = LaunchConfiguration('config_file_pid')
 
@@ -73,7 +83,11 @@ def generate_launch_description():
         DeclareLaunchArgument('log_level', default_value='info'),
         DeclareLaunchArgument(
             'enable_bridge', default_value='false',
-            description='Enable nav2_lane_bridge hybrid controller',
+            description='Enable hybrid_controller for Nav2+lane fusion',
+        ),
+        DeclareLaunchArgument(
+            'enable_plotter', default_value='false',
+            description='Enable controller_plotter_node for live debug plots',
         ),
         DeclareLaunchArgument(
             'config_file',
@@ -177,14 +191,35 @@ def generate_launch_description():
         parameters=[config_file],
     )
 
+    # 3. Yellow Line Follower Controller (PID) — publica /lane/motor_cmd
+    yellow_line_follower_controller = Node(
+        package='qcar2_teleop',
+        executable='yellow_line_follower_controller',
+        name='yellow_line_follower_controller',
+        output='screen',
+        parameters=[config_file, config_file_pid],  # PID gains from pid_tunedv3.yaml
+    )
+
     # ═══════════════════════════════════════════════════════
     # 3) HYBRID BRIDGE (optional — enable with enable_bridge:=true)
     # ═══════════════════════════════════════════════════════
-    nav2_lane_bridge_node = Node(
+    hybrid_controller_node = Node(
         condition=IfCondition(enable_bridge),
         package='qcar2_teleop',
-        executable='nav2_lane_bridge',
-        name='nav2_lane_bridge',
+        executable='hybrid_controller',
+        name='hybrid_controller',
+        output='screen',
+        parameters=[config_file],  # hybrid_controller no usa PID, recibe steering de /lane/motor_cmd
+    )
+
+    # ═══════════════════════════════════════════════════════
+    # 4) DEBUG PLOTTER (optional — enable with enable_plotter:=true)
+    # ═══════════════════════════════════════════════════════
+    controller_plotter_node = Node(
+        condition=IfCondition(enable_plotter),
+        package='qcar2_teleop',
+        executable='controller_plotter_node',
+        name='controller_plotter',
         output='screen',
         parameters=[config_file],
     )
@@ -208,8 +243,12 @@ def generate_launch_description():
     # 2) Lane following
     ld.add_action(color_segmentation_node)
     ld.add_action(yellow_line_position_node)
+    ld.add_action(yellow_line_follower_controller)  # PID controller → /lane/motor_cmd
 
     # 3) Bridge (optional)
-    ld.add_action(nav2_lane_bridge_node)
+    ld.add_action(hybrid_controller_node)
+
+    # 4) Plotter (optional)
+    ld.add_action(controller_plotter_node)
 
     return ld

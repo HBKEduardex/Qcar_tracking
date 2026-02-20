@@ -61,10 +61,10 @@ class BridgeMonitor(Node):
         self.mode_switch_log = []  # last N switches
         self.last_update = time.time()
 
-        # Subscribers — bridge outputs
-        self.create_subscription(Float32, '/bridge/steering', self._cb_steer, 10)
-        self.create_subscription(Float32, '/bridge/speed', self._cb_speed, 10)
-        self.create_subscription(Float32, '/bridge/mode', self._cb_mode, 10)
+        # Subscribers — hybrid_controller outputs (was /bridge/*, now /hybrid/*)
+        self.create_subscription(Float32, '/hybrid/steering', self._cb_steer, 10)
+        self.create_subscription(Float32, '/hybrid/speed', self._cb_speed, 10)
+        self.create_subscription(Float32, '/hybrid/mode', self._cb_mode, 10)
 
         # Subscribers — Nav2 input
         self.create_subscription(Twist, '/cmd_vel_nav', self._cb_nav2, 10)
@@ -77,7 +77,7 @@ class BridgeMonitor(Node):
         # Display timer (10 Hz refresh)
         self.create_timer(0.1, self._display)
 
-        self.get_logger().info('Bridge Monitor started — watching hybrid controller state')
+        self.get_logger().info('Bridge Monitor started — watching hybrid_controller state (/hybrid/*)')
 
     # ─── Callbacks ───
     def _cb_steer(self, msg):
@@ -129,7 +129,7 @@ class BridgeMonitor(Node):
         os.system('clear' if os.name == 'posix' else 'cls')
 
         print(f"{C.BOLD}{C.CYAN}╔══════════════════════════════════════════════════╗{C.RESET}")
-        print(f"{C.BOLD}{C.CYAN}║     🔀  NAV2 ↔ LANE FOLLOWING BRIDGE MONITOR    ║{C.RESET}")
+        print(f"{C.BOLD}{C.CYAN}║   🔀  HYBRID CONTROLLER MONITOR (/hybrid/*)     ║{C.RESET}")
         print(f"{C.BOLD}{C.CYAN}╚══════════════════════════════════════════════════╝{C.RESET}")
         print()
 
@@ -187,7 +187,7 @@ class BridgeMonitor(Node):
         # ─── Decision explanation ───
         print(f"{C.BOLD}  ── Why this mode? ────────────────────────────{C.RESET}")
         if stale or self.bridge_mode < -0.5:
-            print(f"  {C.RED}No data from bridge. Is it running?{C.RESET}")
+            print(f"  {C.RED}No data from hybrid_controller. Is it running?{C.RESET}")
         elif not nav_active:
             print(f"  {C.DIM}Nav2 linear.x ≈ 0 → no goal active → stopped{C.RESET}")
         elif self.bridge_mode >= 0.9:

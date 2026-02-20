@@ -25,11 +25,12 @@ setup(
     entry_points={
         'console_scripts': [
             'teleop_motorcommands = qcar2_teleop.teleop_motorcommands:main',
-            'color_segmentation_node = qcar2_teleop.color_segmentation_node:main',
+            # color_segmentation_node is in qcar2_laneseg_acc package, not here
             'yellow_line_position_node = qcar2_teleop.yellow_line_position_node:main',
             'yellow_line_follower_controller = qcar2_teleop.yellow_line_follower_controller:main',
             'pid_tuner_gui_node = qcar2_teleop.pid_tuner_gui_node:main',
             'controller_plotter_node = qcar2_teleop.controller_plotter_node:main',
+            'hybrid_controller = qcar2_teleop.hybrid_controller:main',
             'nav2_lane_bridge = qcar2_teleop.nav2_lane_bridge:main',
             'bridge_monitor = qcar2_teleop.bridge_monitor_node:main',
         ],

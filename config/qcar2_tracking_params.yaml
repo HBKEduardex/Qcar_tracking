@@ -74,18 +74,18 @@ yellow_line_position_node:
 
 yellow_line_follower_controller:
   ros__parameters:
+    # Topics
     error_topic: "/lane/center/error"
     visible_topic: "/lane/center/visible"
     curvature_topic: "/lane/curvature"
     cmd_topic: "/qcar2_motor_speed_cmd"
+    lane_cmd_topic: "/lane/motor_cmd"
 
-    # PID Esta en los archivos llamados pid en config
-    ##kp: 0.526
-    ##ki: 0.042
-    ##kd: 0.168
+    # PID gains → en pid_tunedv3.yaml (kp, ki, kd, use_kalman, kalman_q, kalman_r)
     integral_limit: 0.8
+    kalman_p0: 1.0
 
-    # Limits / speed
+    # Limits
     max_angle: 0.45
     base_speed: 0.35
     min_speed: 0.15
@@ -93,21 +93,50 @@ yellow_line_follower_controller:
     slowdown_gain: 0.65
     curve_slowdown_gain: 0.4
 
-    # Safety / rate
+    # Safety
     lost_timeout: 0.35
     rate_hz: 20.0
+
+    # Smoothing
     max_steer_rate: 1.5
     visible_hold_sec: 0.20
     derivative_limit: 8.0
 
-    # Kalman Esta en los archivos llamados pid en config
-    #use_kalman: true
-    #kalman_q: 0.02
-    #kalman_r: 0.08
-    kalman_p0: 1.0
-
-    # Debug pubs
+    # Debug
     publish_debug: true
+
+    # Motor commands: publica directo al motor (modo standalone)
+    publish_motor_cmd: false
+    
+    # Velocidad en MotorCommands inter-nodo (/lane/motor_cmd)
+    # Si false: solo envía steering, hybrid_controller usará Nav2 speed o base_autonomous_speed
+    send_speed_in_motor_cmd: true
+
+hybrid_controller:
+  ros__parameters:
+    # Speed control
+    nav2_speed_scale: 1.0
+    base_autonomous_speed: 0.25      # Fallback speed si no hay Nav2 commands
+    curve_slowdown_gain: 0.5
+    error_slowdown_gain: 0.3
+    min_speed: 0.05
+    max_speed: 0.30
+    max_steer_rate: 1.5
+    rate_hz: 50.0
+    lost_timeout: 0.5
+
+    # Steering limits (rad) — debe coincidir con yellow_line_follower_controller
+    max_angle: 0.45
+
+    # MotorCommands topic from lane follower
+    lane_cmd_topic: "/lane/motor_cmd"
+
+    # Intersection turn detection
+    turn_enter_thresh: 0.4           # |angular.z| (rad/s) para entrar en giro
+    turn_exit_thresh: 0.15           # hysteresis para salir del giro
+    turn_steer_gain: 1.0             # gain Nav2 angular.z → steering
+    turn_speed_scale: 0.5            # reduce velocidad durante giros
+    turn_max_steer_rate: 3.0         # rate limit más alto durante giros
 
 controller_plotter:
   ros__parameters:
