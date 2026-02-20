@@ -1,36 +1,45 @@
 #!/usr/bin/env python3
 """
-Hybrid Nav2 ↔ Lane Following Controller (v3 — MotorCommands interface)
+Hybrid Nav2 ↔ Lane Following Controller (v4 — with Exploration Goals)
 
 Architecture:
   - Receives MotorCommands from yellow_line_follower_controller via /lane/motor_cmd
     (steering_angle in rad, motor_throttle in m/s — normalizado per qcar2_interfaces)
   - Receives cmd_vel from Nav2 via /cmd_vel_nav
+  - Receives exploration goals from exploration_manager_node via /exploration_goal
+  - Forwards exploration goals to Nav2 via /goal_pose
   - Detects intersections (high angular.z) and switches modes
   - Publishes MotorCommands to /qcar2_motor_speed_cmd
 
+Behavior:
+  - Before receiving first exploration goal: LANE_ONLY mode (uses lane follower directly)
+  - After receiving first exploration goal: HYBRID mode (Nav2 + lane follower)
+
 Modes:
-  1. LANE_PID   (mode=1.0) — steering+speed from lane follower MotorCommands
-  2. NAV2_TURN  (mode=0.0) — steering from Nav2 angular.z (intersection) + reduced speed
-  3. STOPPED    (mode=-1)  — no commands or Nav2 says stop
+  1. LANE_ONLY (mode=2.0) — steering+speed from lane follower only (no Nav2 dependency)
+  2. LANE_PID  (mode=1.0) — steering from lane follower + speed from Nav2
+  3. NAV2_TURN (mode=0.0) — steering from Nav2 angular.z (intersection) + reduced speed
+  4. STOPPED   (mode=-1)  — no commands or Nav2 says stop
 
 Subscribes:
-  /cmd_vel_nav       (geometry_msgs/Twist)            — Nav2 velocity command
-  /lane/motor_cmd    (qcar2_interfaces/MotorCommands)  — steering+speed from lane follower
-  /lane/center/visible (std_msgs/Bool)                — lane detected?
-  /lane/curvature    (std_msgs/Float32)               — lane curvature (optional)
+  /cmd_vel_nav         (geometry_msgs/Twist)            — Nav2 velocity command
+  /lane/motor_cmd      (qcar2_interfaces/MotorCommands) — steering+speed from lane follower
+  /lane/center/visible (std_msgs/Bool)                  — lane detected?
+  /lane/curvature      (std_msgs/Float32)               — lane curvature (optional)
+  /exploration_goal    (geometry_msgs/PoseStamped)      — goals from exploration manager
 
 Publishes:
   /qcar2_motor_speed_cmd (qcar2_interfaces/MotorCommands) — final motor commands
-  /hybrid/steering       (std_msgs/Float32)      — debug: current steering (rad)
-  /hybrid/speed          (std_msgs/Float32)      — debug: current speed (m/s)
-  /hybrid/mode           (std_msgs/Float32)      — debug: 1.0=lane, 0.0=nav2_turn, -1.0=stopped
+  /goal_pose             (geometry_msgs/PoseStamped)      — goals forwarded to Nav2
+  /hybrid/steering       (std_msgs/Float32)               — debug: current steering (rad)
+  /hybrid/speed          (std_msgs/Float32)               — debug: current speed (m/s)
+  /hybrid/mode           (std_msgs/Float32)               — debug: mode indicator
 """
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32, Bool
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
 from qcar2_interfaces.msg import MotorCommands
 from rcl_interfaces.msg import SetParametersResult
 import math
@@ -44,6 +53,7 @@ def clamp(x, lo, hi):
 MODE_STOPPED   = -1.0
 MODE_NAV2_TURN =  0.0
 MODE_LANE_PID  =  1.0
+MODE_LANE_ONLY =  2.0  # Nuevo: solo lane follower (antes de recibir primer goal)
 
 
 class HybridController(Node):
@@ -71,6 +81,10 @@ class HybridController(Node):
         self.declare_parameter('turn_speed_scale', 0.5)      # speed multiplier during turns
         self.declare_parameter('turn_max_steer_rate', 3.0)   # faster rate limit during turns
 
+        # ── Exploration goal topics ──
+        self.declare_parameter('exploration_goal_topic', '/exploration_goal')
+        self.declare_parameter('nav2_goal_topic', '/goal_pose')
+
         # Load params
         self.nav2_speed_scale = float(self.get_parameter('nav2_speed_scale').value)
         self.base_autonomous_speed = float(self.get_parameter('base_autonomous_speed').value)
@@ -90,6 +104,9 @@ class HybridController(Node):
         self.turn_speed_scale = float(self.get_parameter('turn_speed_scale').value)
         self.turn_max_steer_rate = float(self.get_parameter('turn_max_steer_rate').value)
 
+        self.exploration_goal_topic = self.get_parameter('exploration_goal_topic').value
+        self.nav2_goal_topic = self.get_parameter('nav2_goal_topic').value
+
         # ─── State ───
         self.lane_steering = 0.0          # from lane follower MotorCommands (rad)
         self.lane_speed = 0.0             # from lane follower MotorCommands (m/s)
@@ -104,6 +121,10 @@ class HybridController(Node):
         # Turn state machine
         self.in_nav2_turn = False
 
+        # Exploration goal state — si no ha recibido goal, usa solo lane follower
+        self.has_received_goal = False
+        self.current_goal = None
+
         # ─── Subs ───
         self.sub_cmd_vel = self.create_subscription(
             Twist, '/cmd_vel_nav', self.cb_cmd_vel, 10)
@@ -113,9 +134,16 @@ class HybridController(Node):
             Bool, '/lane/center/visible', self.cb_lane_visible, 10)
         self.sub_curvature = self.create_subscription(
             Float32, '/lane/curvature', self.cb_curvature, 10)
+        
+        # Subscriber para exploration goals
+        self.sub_exploration_goal = self.create_subscription(
+            PoseStamped, self.exploration_goal_topic, self.cb_exploration_goal, 10)
 
         # ─── Pub ───
         self.pub_cmd = self.create_publisher(MotorCommands, '/qcar2_motor_speed_cmd', 10)
+        
+        # Publisher para enviar goals a Nav2
+        self.pub_nav2_goal = self.create_publisher(PoseStamped, self.nav2_goal_topic, 10)
 
         # Debug pubs
         self.pub_hybrid_steer = self.create_publisher(Float32, '/hybrid/steering', 10)
@@ -132,9 +160,12 @@ class HybridController(Node):
         self.get_logger().info('HybridController v3 started (MotorCommands interface)')
         self.get_logger().info(f'  Subscribes to {self.lane_cmd_topic} (MotorCommands from lane follower)')
         self.get_logger().info(f'  Subscribes to /cmd_vel_nav (Nav2 velocity)')
+        self.get_logger().info(f'  Subscribes to {self.exploration_goal_topic} (exploration goals)')
+        self.get_logger().info(f'  Publishes to {self.nav2_goal_topic} (Nav2 goal)')
         self.get_logger().info(f'  max_angle={self.max_angle} rad')
         self.get_logger().info(f'  base_autonomous_speed={self.base_autonomous_speed} (fallback)')
         self.get_logger().info(f'  Publishes to /qcar2_motor_speed_cmd (MotorCommands)')
+        self.get_logger().info(f'  MODE: LANE_ONLY until first exploration goal received')
 
     # ─── Callbacks ───
     def cb_cmd_vel(self, msg: Twist):
@@ -156,6 +187,31 @@ class HybridController(Node):
 
     def cb_curvature(self, msg: Float32):
         self.lane_curvature = msg.data
+
+    def cb_exploration_goal(self, msg: PoseStamped):
+        """
+        Recibe goals de exploration_manager_node y los reenvía a Nav2.
+        La primera vez que recibe un goal, activa el modo híbrido Nav2+lane.
+        """
+        self.current_goal = msg
+        
+        # Publicar el goal a Nav2
+        self.pub_nav2_goal.publish(msg)
+        
+        if not self.has_received_goal:
+            self.has_received_goal = True
+            self.get_logger().info(
+                '═══════════════════════════════════════════════════════════\n'
+                '  🎯 FIRST EXPLORATION GOAL RECEIVED!\n'
+                f'  Goal: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f})\n'
+                '  Switching from LANE_ONLY → HYBRID mode (Nav2 + Lane)\n'
+                '═══════════════════════════════════════════════════════════'
+            )
+        else:
+            self.get_logger().info(
+                f'New exploration goal: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f}) '
+                f'→ forwarded to {self.nav2_goal_topic}'
+            )
 
     # ─── Param change ───
     def _on_params_change(self, params):
@@ -192,6 +248,51 @@ class HybridController(Node):
         now = self.get_clock().now()
         dt_nav2 = (now - self.last_nav2_time).nanoseconds * 1e-9
         dt_steering = (now - self.last_steering_time).nanoseconds * 1e-9
+
+        # ══════════════════════════════════════════════════════════════════
+        # MODO LANE_ONLY: antes de recibir el primer exploration goal
+        # Usa directamente steering+speed del lane follower, ignora Nav2
+        # ══════════════════════════════════════════════════════════════════
+        if not self.has_received_goal:
+            # Sin goal aún → modo LANE_ONLY (solo lane follower)
+            if dt_steering > self.lost_timeout or not self.lane_visible:
+                # Lane perdido → parar
+                self._publish_motor(0.0, 0.0)
+                self._pub_debug(0.0, 0.0, MODE_STOPPED)
+                self.prev_steering = 0.0
+                return
+
+            # Usar steering y speed directamente del lane follower
+            steering_desired = clamp(self.lane_steering, -self.max_angle, self.max_angle)
+            
+            # Rate limiter
+            dt = 1.0 / max(1.0, self.rate_hz)
+            max_delta = self.max_steer_rate * dt
+            delta = clamp(steering_desired - self.prev_steering, -max_delta, max_delta)
+            steering = clamp(self.prev_steering + delta, -self.max_angle, self.max_angle)
+            self.prev_steering = steering
+
+            # Speed del lane follower o base_autonomous_speed
+            if abs(self.lane_speed) > 0.001:
+                speed = abs(self.lane_speed)
+            else:
+                speed = self.base_autonomous_speed
+
+            # Curve slowdown
+            curv_norm = clamp(abs(self.lane_curvature) * 1000.0, 0.0, 1.0)
+            curve_factor = 1.0 - self.curve_slowdown_gain * curv_norm
+            curve_factor = clamp(curve_factor, 0.3, 1.0)
+            speed = speed * curve_factor
+            speed = clamp(speed, self.min_speed, self.max_speed)
+
+            self._publish_motor(steering, speed)
+            self._pub_debug(steering, speed, MODE_LANE_ONLY)
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # MODO HÍBRIDO: después de recibir al menos un exploration goal
+        # Depende de Nav2 para navegación + lane follower para steering fino
+        # ══════════════════════════════════════════════════════════════════
 
         # ── STOPPED: no Nav2 data for too long ──
         if dt_nav2 > self.lost_timeout:
