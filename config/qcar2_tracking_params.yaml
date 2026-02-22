@@ -9,7 +9,7 @@
       center_error: "/lane/center/error"
       center_visible: "/lane/center/visible"
       curvature: "/lane/curvature"
-      motor_cmd: "/qcar2_motor_speed_cmd"
+      motor_cmd: "/hybrid/motor"
 
 color_segmentation_node:
   ros__parameters:
@@ -80,7 +80,7 @@ yellow_line_follower_controller:
     error_topic: "/lane/center/error"
     visible_topic: "/lane/center/visible"
     curvature_topic: "/lane/curvature"
-    cmd_topic: "/qcar2_motor_speed_cmd"
+    cmd_topic: "/hybrid/motor"
     lane_cmd_topic: "/lane/motor_cmd"
 
     # PID gains → en pid_tunedv3.yaml (kp, ki, kd, use_kalman, kalman_q, kalman_r)
@@ -126,12 +126,19 @@ hybrid_controller:
     max_steer_rate: 1.5
     rate_hz: 50.0
     lost_timeout: 0.5
+    
+
+    enable_bridge: true
+
 
     # Steering limits (rad) — debe coincidir con yellow_line_follower_controller
     max_angle: 0.6
 
     # MotorCommands topic from lane follower
     lane_cmd_topic: "/lane/motor_cmd"
+    
+    # Output motor commands to mixer (final pre-hardware stage)
+    cmd_topic: "/hybrid/motor"
 
     # Intersection turn detection
     turn_enter_thresh: 0.4           # |angular.z| (rad/s) para entrar en giro

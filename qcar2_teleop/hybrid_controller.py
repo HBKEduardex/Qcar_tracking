@@ -79,6 +79,7 @@ class HybridController(Node):
         self.declare_parameter('lost_timeout', 0.5)
         self.declare_parameter('max_angle', 0.45)            # max steering angle (rad)
         self.declare_parameter('lane_cmd_topic', '/lane/motor_cmd')  # MotorCommands from lane follower
+        self.declare_parameter('cmd_topic', '/hybrid/motor')          # Output topic (consumed by qcar2_mixer)
 
         # ── Intersection turn detection ──
         self.declare_parameter('turn_enter_thresh', 0.4)     # |angular.z| to enter NAV2_TURN (rad/s)
@@ -127,6 +128,7 @@ class HybridController(Node):
         self.lost_timeout = float(self.get_parameter('lost_timeout').value)
         self.max_angle = float(self.get_parameter('max_angle').value)
         self.lane_cmd_topic = self.get_parameter('lane_cmd_topic').value
+        self.cmd_topic = self.get_parameter('cmd_topic').value
 
         self.turn_enter_thresh = float(self.get_parameter('turn_enter_thresh').value)
         self.turn_exit_thresh = float(self.get_parameter('turn_exit_thresh').value)
@@ -203,7 +205,7 @@ class HybridController(Node):
             Float32, self.edge_position_topic, self.cb_edge_position, 10)
 
         # ─── Pub ───
-        self.pub_cmd = self.create_publisher(MotorCommands, '/qcar2_motor_speed_cmd', 10)
+        self.pub_cmd = self.create_publisher(MotorCommands, self.cmd_topic, 10)
         
         # Publisher para enviar goals a Nav2
         self.pub_nav2_goal = self.create_publisher(PoseStamped, self.nav2_goal_topic, 10)
@@ -232,7 +234,7 @@ class HybridController(Node):
         self.get_logger().info(f'  max_angle={self.max_angle} rad')
         self.get_logger().info(f'  base_autonomous_speed={self.base_autonomous_speed} (fallback)')
         self.get_logger().info(f'  hybrid_use_max_speed={self.hybrid_use_max_speed} (anti-minima)')
-        self.get_logger().info(f'  Publishes to /qcar2_motor_speed_cmd (MotorCommands)')
+        self.get_logger().info(f'  Publishes to {self.cmd_topic} (MotorCommands)  [→ qcar2_mixer]')
         self.get_logger().info(f'  MODE: LANE_ONLY until first exploration goal received')
 
     # ─── Callbacks ───
