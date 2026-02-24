@@ -170,8 +170,8 @@ hybrid_controller:
     # Hybrid steering blend parameters
     # IMPORTANTE: Cuando hay un goal activo, Nav2 debe tener prioridad para dirigir al robot
     # hacia el goal. Lane follower solo ayuda a mantenerse en el carril.
-    hybrid_nav2_steer_weight: 0.8    # Peso del steering de Nav2 (dirección al goal) - RUDO: 100% Nav2
-    hybrid_lane_steer_weight: 0.2    # Peso del steering del lane follower (mantenerse en carril)
+    hybrid_nav2_steer_weight: 0.65    # Peso del steering de Nav2 (dirección al goal) - RUDO: 100% Nav2
+    hybrid_lane_steer_weight: 0.35    # Peso del steering del lane follower (mantenerse en carril)
     
     # Edge safety parameters (evitar cruzar/chocar línea roja)
     # Cuando Nav2 controla y hay solo 1 línea roja detectada, evitar cruzarla
