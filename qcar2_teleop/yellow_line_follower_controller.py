@@ -77,8 +77,8 @@ class YellowLineFollowerController(Node):
         # Limits / speed
         self.declare_parameter('max_angle', 0.45)     # rad
         self.declare_parameter('base_speed', 0.35)
-        self.declare_parameter('min_speed', 0.15)
-        self.declare_parameter('max_speed', 0.30)
+        self.declare_parameter('min_speed', 0.10)
+        self.declare_parameter('max_speed', 0.20)
         self.declare_parameter('slowdown_gain', 0.65)  # baja speed con |error|
         self.declare_parameter('curve_slowdown_gain', 0.4)  # baja speed extra en curvas
 

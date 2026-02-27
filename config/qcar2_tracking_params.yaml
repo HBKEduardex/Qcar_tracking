@@ -122,7 +122,7 @@ hybrid_controller:
     curve_slowdown_gain: 0.5
     error_slowdown_gain: 0.3
     min_speed: 0.05
-    max_speed: 0.30
+    max_speed: 0.20
     max_steer_rate: 1.5
     rate_hz: 50.0
     lost_timeout: 0.5
@@ -187,3 +187,42 @@ controller_plotter:
     cmd_topic: "/qcar2_motor_speed_cmd"
     history_sec: 12.0
     update_hz: 20.0
+
+hybrid_switch_controller:
+  ros__parameters:
+    # Angular switch threshold (rad) — if |yaw_error| > this → Nav2, else → PID
+    yaw_error_threshold: 1.4      # ~28°
+
+    # Distance (m) to consider a mission goal reached
+    goal_tolerance: 0.3
+
+    # Max Nav2 retries before skipping a goal
+    retry_limit: 5
+
+    # Control loop frequency
+    rate_hz: 20.0
+
+    # TF frames
+    map_frame: "map"
+    base_frame: "base_link"
+
+    # Topics
+    mission_goals_topic: "/mission_goals"
+    motor_cmd_topic: "/qcar2_motor_speed_cmd"
+    lane_cmd_topic: "/lane/motor_cmd"
+
+    # If > 0, override PID speed with this value (m/s). 0 = use PID speed.
+    pid_speed_override: 0.0
+
+    # Nav2 topics
+    goal_pose_topic: "/goal_pose"
+    cmd_vel_topic: "/cmd_vel_nav"
+
+    # Nav2 cmd_vel → motor bridging
+    nav2_steer_gain: 1.0           # angular.z → steering gain
+    nav2_speed_scale: 1.0          # linear.x → speed scale
+    max_angle: 0.45                # max steering (rad)
+    max_speed: 0.30                # max speed (m/s)
+    nav2_timeout: 0.5              # seconds without cmd_vel → stop
+
+

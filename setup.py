@@ -33,6 +33,12 @@ setup(
             'hybrid_controller = qcar2_teleop.hybrid_controller:main',
             'nav2_lane_bridge = qcar2_teleop.nav2_lane_bridge:main',
             'bridge_monitor = qcar2_teleop.bridge_monitor_node:main',
+            'mission_lane_bridge = qcar2_teleop.mission_lane_bridge:main',
+            'path_follower_node = qcar2_teleop.path_follower_node:main',
+            'goal_republisher = qcar2_teleop.goal_republisher_node:main',
+            'mamada = qcar2_teleop.mamada:main',
+            'hybrid_switch_controller = qcar2_teleop.hybrid_switch_controller_node:main',
+            'nav2_motor_test = qcar2_teleop.nav2_motor_test:main',
         ],
     },
 )
