@@ -130,6 +130,7 @@ class HybridSwitchController(Node):
         self.declare_parameter('max_speed', 0.30)
         self.declare_parameter('nav2_timeout', 0.5)
         self.declare_parameter('retry_interval', 3.0)
+        self.declare_parameter('yaw_error_threshold', 0.5)     # rad
 
         # ── Read all parameters ─────────────────────────────────────────
         mask_topic = str(self.get_parameter('mask_topic').value)
@@ -158,6 +159,7 @@ class HybridSwitchController(Node):
         self.max_speed = float(self.get_parameter('max_speed').value)
         self.nav2_timeout = float(self.get_parameter('nav2_timeout').value)
         self.retry_interval = float(self.get_parameter('retry_interval').value)
+        self.yaw_error_threshold = float(self.get_parameter('yaw_error_threshold').value)
 
         # ── State: FSM ──────────────────────────────────────────────────
         self.fsm_state = STATE_PID_ROAD
@@ -471,51 +473,106 @@ class HybridSwitchController(Node):
 
         # ── MODE DECISION (based on FSM state) ──────────────────────────
         if self.fsm_state == STATE_NAV2_INTERSECTION:
-            # ═══════════════ NAV2 MODE ═══════════════════════════════════
-            self.current_mode = MODE_NAV2
+            # ══════ INTERSECTION: yaw gate (quaternion-based) ══════════════
 
-            # Send goal if not yet sent
-            if not self.goal_sent_to_nav2:
-                self._send_goal_pose(goal)
+            # Yaw from quaternions: robot (TF) vs goal (PoseStamped)
+            goal_yaw = quat_to_yaw(goal.pose.orientation)
+            self.yaw_error = normalize_angle(goal_yaw - ryaw)
+            self.yaw_goal = goal_yaw
 
-            # Bridge /cmd_vel_nav → motors with max steering + auto-retry
-            now = self.get_clock().now()
-            dt_cmd = (now - self.last_cmd_vel_time).nanoseconds * 1e-9
+            if abs(self.yaw_error) <= self.yaw_error_threshold:
+                # ── Yaw small → PID lane following through intersection ────
+                self.current_mode = MODE_PID
+                self.nav2_status = 'PID_THRU'
+                if self.goal_sent_to_nav2:
+                    self.goal_sent_to_nav2 = False
 
-            if dt_cmd > self.nav2_timeout:
-                # Nav2 stopped → auto-retry
-                self._publish_motor(0.0, 0.0)
-                self.active_steering = 0.0
-                self.active_speed = 0.0
-
-                dt_retry = (now - self.last_retry_time).nanoseconds * 1e-9
-                if dt_retry >= self.retry_interval:
-                    self.retry_count += 1
-                    self.last_retry_time = now
-                    self.nav2_status = 'RETRYING'
-                    self._send_goal_pose(goal)
-                    self.get_logger().warn(
-                        f'🔁 RETRY #{self.retry_count}: Nav2 timeout '
-                        f'({dt_cmd:.1f}s) → re-sent Goal '
-                        f'{self.current_goal_idx + 1}/{len(self.mission_goals)}'
-                    )
-                else:
-                    self.nav2_status = 'NO_CMD_VEL'
-            else:
-                # Nav2 active → max steering in turn direction
-                self.nav2_status = 'ACTIVE'
-                if abs(self.nav2_angular_z) > 0.01:
-                    steering = self.max_angle if self.nav2_angular_z > 0 else -self.max_angle
-                else:
-                    steering = 0.0
-
-                speed = clamp(
-                    self.nav2_speed_scale * self.nav2_linear_x,
-                    -self.max_speed, self.max_speed
-                )
+                steering = self.lane_steering
+                speed = self.lane_speed
+                if self.pid_speed_override > 0.0:
+                    speed = self.pid_speed_override
                 self._publish_motor(steering, speed)
                 self.active_steering = steering
                 self.active_speed = speed
+
+            else:
+                # ── Yaw large → ACTIVATE Nav2 for the turn ────────────────
+
+                # Record initial sign when Nav2 first activates
+                if not self.goal_sent_to_nav2:
+                    self._nav2_initial_sign = 1.0 if self.yaw_error >= 0 else -1.0
+                    self.get_logger().info(
+                        f'🔀 |yaw_err|={abs(self.yaw_error):.2f}rad '
+                        f'({math.degrees(abs(self.yaw_error)):.0f}°) > '
+                        f'{self.yaw_error_threshold} → Nav2 '
+                        f'(sign={"+1" if self._nav2_initial_sign > 0 else "-1"})'
+                    )
+                    self._send_goal_pose(goal)
+
+                # Check if correction is done: sign flipped or near zero
+                current_sign = 1.0 if self.yaw_error >= 0 else -1.0
+                sign_flipped = (hasattr(self, '_nav2_initial_sign') and
+                                current_sign != self._nav2_initial_sign)
+                near_zero = abs(self.yaw_error) < 0.1  # ~5.7°
+
+                if sign_flipped or near_zero:
+                    # Turn correction complete → back to PID
+                    reason = 'sign_flip' if sign_flipped else 'near_zero'
+                    self.get_logger().info(
+                        f'✅ Nav2 turn done ({reason}): '
+                        f'yaw_err={self.yaw_error:.2f}rad → PID'
+                    )
+                    self.current_mode = MODE_PID
+                    self.nav2_status = 'PID_THRU'
+                    self.goal_sent_to_nav2 = False
+
+                    steering = self.lane_steering
+                    speed = self.lane_speed
+                    if self.pid_speed_override > 0.0:
+                        speed = self.pid_speed_override
+                    self._publish_motor(steering, speed)
+                    self.active_steering = steering
+                    self.active_speed = speed
+
+                else:
+                    # Still correcting → bridge Nav2
+                    self.current_mode = MODE_NAV2
+
+                    now = self.get_clock().now()
+                    dt_cmd = (now - self.last_cmd_vel_time).nanoseconds * 1e-9
+
+                    if dt_cmd > self.nav2_timeout:
+                        self._publish_motor(0.0, 0.0)
+                        self.active_steering = 0.0
+                        self.active_speed = 0.0
+
+                        dt_retry = (now - self.last_retry_time).nanoseconds * 1e-9
+                        if dt_retry >= self.retry_interval:
+                            self.retry_count += 1
+                            self.last_retry_time = now
+                            self.nav2_status = 'RETRYING'
+                            self._send_goal_pose(goal)
+                            self.get_logger().warn(
+                                f'🔁 RETRY #{self.retry_count}: Nav2 timeout '
+                                f'({dt_cmd:.1f}s) → re-sent Goal '
+                                f'{self.current_goal_idx + 1}/{len(self.mission_goals)}'
+                            )
+                        else:
+                            self.nav2_status = 'NO_CMD_VEL'
+                    else:
+                        self.nav2_status = 'ACTIVE'
+                        if abs(self.nav2_angular_z) > 0.01:
+                            steering = self.max_angle if self.nav2_angular_z > 0 else -self.max_angle
+                        else:
+                            steering = 0.0
+
+                        speed = clamp(
+                            self.nav2_speed_scale * self.nav2_linear_x,
+                            -self.max_speed, self.max_speed
+                        )
+                        self._publish_motor(steering, speed)
+                        self.active_steering = steering
+                        self.active_speed = speed
 
         else:
             # ═══════════════ PID MODE (PID_ROAD or RECOVERY) ═════════════

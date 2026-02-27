@@ -219,6 +219,7 @@ hybrid_switch_controller:
     max_speed: 0.30                # max speed (m/s)
     nav2_timeout: 0.5              # seconds without cmd_vel → auto-retry
     retry_interval: 3.0            # seconds between retries
+    yaw_error_threshold: 0.5       # rad — Nav2 only if |goal_yaw - robot_yaw| > this
 
 
 

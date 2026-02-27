@@ -43,6 +43,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_speed', default_value='0.30'),
         DeclareLaunchArgument('nav2_timeout', default_value='0.5'),
         DeclareLaunchArgument('retry_interval', default_value='3.0'),
+        DeclareLaunchArgument('yaw_error_threshold', default_value='0.5'),
     ]
 
     # ── PID Controller (output only, no motor publishing) ───────────────
@@ -88,6 +89,7 @@ def generate_launch_description():
             'max_speed': LaunchConfiguration('max_speed'),
             'nav2_timeout': LaunchConfiguration('nav2_timeout'),
             'retry_interval': LaunchConfiguration('retry_interval'),
+            'yaw_error_threshold': LaunchConfiguration('yaw_error_threshold'),
         }],
     )
 
