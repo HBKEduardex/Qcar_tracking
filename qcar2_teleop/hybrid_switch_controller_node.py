@@ -137,6 +137,7 @@ class HybridSwitchController(Node):
         self.declare_parameter('blind_heading_kp', 0.5)        # yaw→steer gain
         self.declare_parameter('blind_max_steer', 0.15)        # rad (~8.5°)
         self.declare_parameter('blind_pid_blend', 0.3)         # max PID weight
+        self.declare_parameter('blind_red_threshold', 0.065)    # red ratio below = no edges
 
         # ── Read all parameters ─────────────────────────────────────────
         mask_topic = str(self.get_parameter('mask_topic').value)
@@ -172,6 +173,7 @@ class HybridSwitchController(Node):
         self.blind_heading_kp = float(self.get_parameter('blind_heading_kp').value)
         self.blind_max_steer = float(self.get_parameter('blind_max_steer').value)
         self.blind_pid_blend = float(self.get_parameter('blind_pid_blend').value)
+        self.blind_red_threshold = float(self.get_parameter('blind_red_threshold').value)
 
         # ── State: FSM ──────────────────────────────────────────────────
         self.fsm_state = STATE_PID_ROAD
@@ -183,8 +185,10 @@ class HybridSwitchController(Node):
         self.bridge_cv = CvBridge()
         self.yellow_px = 0
         self.blue_px = 0
+        self.red_px = 0
         self.yellow_ratio = 0.0
         self.blue_ratio = 0.0
+        self.red_ratio = 0.0
         self.gate_nav2_allowed = False
         self.mask_frame_count = 0
 
@@ -303,6 +307,11 @@ class HybridSwitchController(Node):
         blue_bin = ((b > 200) & (g < 80) & (r < 80)).astype(np.uint8)
         self.blue_px = int(np.count_nonzero(blue_bin))
         self.blue_ratio = self.blue_px / roi_area
+
+        # Red (edges): R>150, G<100, B<100  (same as yellow_line_position_node)
+        red_bin = ((r > 150) & (g < 100) & (b < 100)).astype(np.uint8)
+        self.red_px = int(np.count_nonzero(red_bin))
+        self.red_ratio = self.red_px / roi_area
 
         # Periodic debug log
         self.mask_frame_count += 1
@@ -496,10 +505,11 @@ class HybridSwitchController(Node):
                 if self.goal_sent_to_nav2:
                     self.goal_sent_to_nav2 = False
 
-                # Dual-signal: is PID blind at an intersection?
+                # Triple-signal: is PID blind at an intersection?
                 yellow_low = self.yellow_ratio < self.yellow_low_thresh
                 blue_high = self.blue_ratio > self.blue_high_thresh
-                in_intersection_blind = yellow_low and blue_high
+                red_low = self.red_ratio < self.blind_red_threshold
+                in_intersection_blind = yellow_low and blue_high and red_low
 
                 if in_intersection_blind:
                     # ── BLIND_STRAIGHT: intersection, no lane data ────
@@ -548,7 +558,8 @@ class HybridSwitchController(Node):
                     # Check if still blind after the turn
                     yellow_low = self.yellow_ratio < self.yellow_low_thresh
                     blue_high = self.blue_ratio > self.blue_high_thresh
-                    in_intersection_blind = yellow_low and blue_high
+                    red_low = self.red_ratio < self.blind_red_threshold
+                    in_intersection_blind = yellow_low and blue_high and red_low
 
                     if in_intersection_blind:
                         # ── BLIND_STRAIGHT after turn ─────────────────

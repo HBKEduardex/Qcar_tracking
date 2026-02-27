@@ -26,8 +26,8 @@ yellow_line_position_node:
     center_error_topic: "/lane/center/error"
     center_visible_topic: "/lane/center/visible"
     curvature_topic: "/lane/curvature"
-    edge_count_topic: "/lane/edge/count"      # Número de bordes detectados (0, 1, 2)
-    edge_position_topic: "/lane/edge/position"  # Posición normalizada del borde rojo (-1 a 1)
+    edge_count_topic: "/lane/edge/count" # Número de bordes detectados (0, 1, 2)
+    edge_position_topic: "/lane/edge/position" # Posición normalizada del borde rojo (-1 a 1)
 
     # ROI
     use_bottom_ratio: 0.15
@@ -109,7 +109,7 @@ yellow_line_follower_controller:
 
     # Motor commands: publica directo al motor (modo standalone)
     publish_motor_cmd: false
-    
+
     # Velocidad en MotorCommands inter-nodo (/lane/motor_cmd)
     # Si false: solo envía steering, hybrid_controller usará Nav2 speed o base_autonomous_speed
     send_speed_in_motor_cmd: true
@@ -118,7 +118,7 @@ hybrid_controller:
   ros__parameters:
     # Speed control
     nav2_speed_scale: 1.0
-    base_autonomous_speed: 0.25      # Fallback speed si no hay Nav2 commands
+    base_autonomous_speed: 0.25 # Fallback speed si no hay Nav2 commands
     curve_slowdown_gain: 0.5
     error_slowdown_gain: 0.3
     min_speed: 0.05
@@ -126,26 +126,24 @@ hybrid_controller:
     max_steer_rate: 1.5
     rate_hz: 50.0
     lost_timeout: 0.5
-    
 
     enable_bridge: true
-
 
     # Steering limits (rad) — debe coincidir con yellow_line_follower_controller
     max_angle: 0.6
 
     # MotorCommands topic from lane follower
     lane_cmd_topic: "/lane/motor_cmd"
-    
+
     # Output motor commands to mixer (final pre-hardware stage)
     cmd_topic: "/hybrid/motor"
 
     # Intersection turn detection
-    turn_enter_thresh: 0.4           # |angular.z| (rad/s) para entrar en giro
-    turn_exit_thresh: 0.15           # hysteresis para salir del giro
-    turn_steer_gain: 4.5             # gain Nav2 angular.z → steering (AUMENTADO para giros más agresivos)
-    turn_speed_scale: 0.5            # reduce velocidad durante giros
-    turn_max_steer_rate: 3.0         # rate limit más alto durante giros
+    turn_enter_thresh: 0.4 # |angular.z| (rad/s) para entrar en giro
+    turn_exit_thresh: 0.15 # hysteresis para salir del giro
+    turn_steer_gain: 4.5 # gain Nav2 angular.z → steering (AUMENTADO para giros más agresivos)
+    turn_speed_scale: 0.5 # reduce velocidad durante giros
+    turn_max_steer_rate: 3.0 # rate limit más alto durante giros
 
     # Exploration goal topics
     exploration_goal_topic: "/exploration_goal"
@@ -156,29 +154,29 @@ hybrid_controller:
     edge_count_topic: "/lane/edge/count"
 
     # Forced Nav2 parameters (when lane detection is poor)
-    nav2_forced_speed_scale: 0.7     # Reduce speed when forcing Nav2
-    nav2_forced_steer_gain: 2.98      # Steering gain when forcing Nav2 (AUMENTADO)
-    min_edges_for_lane: 2            # Min "edges" needed to trust lane follower (0,1,2)
-    require_yellow_for_lane: true    # Require yellow line visible for lane mode
-    
+    nav2_forced_speed_scale: 0.7 # Reduce speed when forcing Nav2
+    nav2_forced_steer_gain: 2.98 # Steering gain when forcing Nav2 (AUMENTADO)
+    min_edges_for_lane: 2 # Min "edges" needed to trust lane follower (0,1,2)
+    require_yellow_for_lane: true # Require yellow line visible for lane mode
+
     # Hybrid anti-local-minima parameters
     # El robot Ackermann puede atascarse en mínimos locales cuando Nav2 no encuentra camino directo.
     # Estos parámetros controlan cómo se mezclan las velocidades de Nav2 y lane follower.
-    hybrid_lane_speed_factor: 0.8    # Factor para velocidad del lane follower en modo híbrido
-    hybrid_use_max_speed: true       # true=max(nav2,lane), false=solo nav2
-    
+    hybrid_lane_speed_factor: 0.8 # Factor para velocidad del lane follower en modo híbrido
+    hybrid_use_max_speed: true # true=max(nav2,lane), false=solo nav2
+
     # Hybrid steering blend parameters
     # IMPORTANTE: Cuando hay un goal activo, Nav2 debe tener prioridad para dirigir al robot
     # hacia el goal. Lane follower solo ayuda a mantenerse en el carril.
-    hybrid_nav2_steer_weight: 0.8    # Peso del steering de Nav2 (dirección al goal) - RUDO: 100% Nav2
-    hybrid_lane_steer_weight: 0.2    # Peso del steering del lane follower (mantenerse en carril)
-    
+    hybrid_nav2_steer_weight: 0.8 # Peso del steering de Nav2 (dirección al goal) - RUDO: 100% Nav2
+    hybrid_lane_steer_weight: 0.2 # Peso del steering del lane follower (mantenerse en carril)
+
     # Edge safety parameters (evitar cruzar/chocar línea roja)
     # Cuando Nav2 controla y hay solo 1 línea roja detectada, evitar cruzarla
-    edge_position_topic: "/lane/edge/position"  # Topic con posición normalizada del borde
-    edge_safety_enabled: true        # Habilitar prevención de cruce de línea roja
-    edge_safety_threshold: 0.6       # Posición del borde para activar (0-1, mayor = más cerca del borde)
-    edge_safety_steer_limit: 0.3     # Máximo steering permitido hacia la línea (rad, ~17°)
+    edge_position_topic: "/lane/edge/position" # Topic con posición normalizada del borde
+    edge_safety_enabled: true # Habilitar prevención de cruce de línea roja
+    edge_safety_threshold: 0.6 # Posición del borde para activar (0-1, mayor = más cerca del borde)
+    edge_safety_steer_limit: 0.3 # Máximo steering permitido hacia la línea (rad, ~17°)
 
 controller_plotter:
   ros__parameters:
@@ -193,13 +191,13 @@ hybrid_switch_controller:
     # ── Pixel gating (FSM) ──
     mask_topic: "/lokita"
     use_bottom_ratio: 0.45
-    yellow_low_threshold: 0.04     # yellow_ratio below this = "no lane"
-    blue_high_threshold: 0.6      # blue_ratio above this = "intersection"
-    blue_exit_threshold: 0.3       # blue_ratio below this = exit Nav2
-    activate_frames: 3             # frames to enter NAV2_INTERSECTION
-    reacquire_frames: 5            # frames to exit NAV2_INTERSECTION
-    cooldown_sec: 3.0              # seconds in RECOVERY before PID_ROAD
-    gate_mode: "AND"               # AND / OR / YELLOW_ONLY
+    yellow_low_threshold: 0.04 # yellow_ratio below this = "no lane"
+    blue_high_threshold: 0.6 # blue_ratio above this = "intersection"
+    blue_exit_threshold: 0.3 # blue_ratio below this = exit Nav2
+    activate_frames: 3 # frames to enter NAV2_INTERSECTION
+    reacquire_frames: 5 # frames to exit NAV2_INTERSECTION
+    cooldown_sec: 3.0 # seconds in RECOVERY before PID_ROAD
+    gate_mode: "AND" # AND / OR / YELLOW_ONLY
 
     # ── Navigation ──
     goal_tolerance: 0.3
@@ -215,15 +213,16 @@ hybrid_switch_controller:
 
     # ── Nav2 cmd_vel → motor bridging ──
     nav2_speed_scale: 1.0
-    max_angle: 0.45                # max steering (rad)
-    max_speed: 0.30                # max speed (m/s)
-    nav2_timeout: 0.5              # seconds without cmd_vel → auto-retry
-    retry_interval: 3.0            # seconds between retries
-    yaw_error_threshold: 0.5       # rad — Nav2 only if |goal_yaw - robot_yaw| > this
+    max_angle: 0.45 # max steering (rad)
+    max_speed: 0.30 # max speed (m/s)
+    nav2_timeout: 0.5 # seconds without cmd_vel → auto-retry
+    retry_interval: 3.0 # seconds between retries
+    yaw_error_threshold: 0.5 # rad — Nav2 only if |goal_yaw - robot_yaw| > this
 
     # ── Blind-drive at intersections (no lane data for PID) ──
-    blind_drive_speed: 0.20        # forward speed (m/s)
-    blind_heading_kp: 0.5          # heading correction gain (yaw_error → steering)
-    blind_max_steer: 0.15          # max steering in blind mode (rad, ~8.5°)
-    blind_pid_blend: 0.3           # max PID blend weight when yellow partially visible
+    blind_drive_speed: 0.20 # forward speed (m/s)
+    blind_heading_kp: 0.5 # heading correction gain (yaw_error → steering)
+    blind_max_steer: 0.15 # max steering in blind mode (rad, ~8.5°)
+    blind_pid_blend: 0.3 # max PID blend weight when yellow partially visible
+    blind_red_threshold: 0.065 # red ratio below this = no edges (intersection confirmed)
 
