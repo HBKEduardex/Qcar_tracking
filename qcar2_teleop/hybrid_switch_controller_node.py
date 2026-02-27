@@ -132,6 +132,12 @@ class HybridSwitchController(Node):
         self.declare_parameter('retry_interval', 3.0)
         self.declare_parameter('yaw_error_threshold', 0.5)     # rad
 
+        # ── Parameters: Blind-drive at intersections ────────────────────
+        self.declare_parameter('blind_drive_speed', 0.20)      # m/s
+        self.declare_parameter('blind_heading_kp', 0.5)        # yaw→steer gain
+        self.declare_parameter('blind_max_steer', 0.15)        # rad (~8.5°)
+        self.declare_parameter('blind_pid_blend', 0.3)         # max PID weight
+
         # ── Read all parameters ─────────────────────────────────────────
         mask_topic = str(self.get_parameter('mask_topic').value)
         self.use_bottom_ratio = float(self.get_parameter('use_bottom_ratio').value)
@@ -160,6 +166,12 @@ class HybridSwitchController(Node):
         self.nav2_timeout = float(self.get_parameter('nav2_timeout').value)
         self.retry_interval = float(self.get_parameter('retry_interval').value)
         self.yaw_error_threshold = float(self.get_parameter('yaw_error_threshold').value)
+
+        # Blind-drive
+        self.blind_drive_speed = float(self.get_parameter('blind_drive_speed').value)
+        self.blind_heading_kp = float(self.get_parameter('blind_heading_kp').value)
+        self.blind_max_steer = float(self.get_parameter('blind_max_steer').value)
+        self.blind_pid_blend = float(self.get_parameter('blind_pid_blend').value)
 
         # ── State: FSM ──────────────────────────────────────────────────
         self.fsm_state = STATE_PID_ROAD
@@ -481,19 +493,28 @@ class HybridSwitchController(Node):
             self.yaw_goal = goal_yaw
 
             if abs(self.yaw_error) <= self.yaw_error_threshold:
-                # ── Yaw small → PID lane following through intersection ────
-                self.current_mode = MODE_PID
-                self.nav2_status = 'PID_THRU'
                 if self.goal_sent_to_nav2:
                     self.goal_sent_to_nav2 = False
 
-                steering = self.lane_steering
-                speed = self.lane_speed
-                if self.pid_speed_override > 0.0:
-                    speed = self.pid_speed_override
-                self._publish_motor(steering, speed)
-                self.active_steering = steering
-                self.active_speed = speed
+                # Dual-signal: is PID blind at an intersection?
+                yellow_low = self.yellow_ratio < self.yellow_low_thresh
+                blue_high = self.blue_ratio > self.blue_high_thresh
+                in_intersection_blind = yellow_low and blue_high
+
+                if in_intersection_blind:
+                    # ── BLIND_STRAIGHT: intersection, no lane data ────
+                    steering, speed = self._blind_straight_output()
+                else:
+                    # ── PID_THRU: lane data available (original) ──────
+                    self.current_mode = MODE_PID
+                    self.nav2_status = 'PID_THRU'
+                    steering = self.lane_steering
+                    speed = self.lane_speed
+                    if self.pid_speed_override > 0.0:
+                        speed = self.pid_speed_override
+                    self._publish_motor(steering, speed)
+                    self.active_steering = steering
+                    self.active_speed = speed
 
             else:
                 # ── Yaw large → ACTIVATE Nav2 for the turn ────────────────
@@ -516,23 +537,33 @@ class HybridSwitchController(Node):
                 near_zero = abs(self.yaw_error) < 0.1  # ~5.7°
 
                 if sign_flipped or near_zero:
-                    # Turn correction complete → back to PID
+                    # Turn correction complete
                     reason = 'sign_flip' if sign_flipped else 'near_zero'
                     self.get_logger().info(
                         f'✅ Nav2 turn done ({reason}): '
-                        f'yaw_err={self.yaw_error:.2f}rad → PID'
+                        f'yaw_err={self.yaw_error:.2f}rad'
                     )
-                    self.current_mode = MODE_PID
-                    self.nav2_status = 'PID_THRU'
                     self.goal_sent_to_nav2 = False
 
-                    steering = self.lane_steering
-                    speed = self.lane_speed
-                    if self.pid_speed_override > 0.0:
-                        speed = self.pid_speed_override
-                    self._publish_motor(steering, speed)
-                    self.active_steering = steering
-                    self.active_speed = speed
+                    # Check if still blind after the turn
+                    yellow_low = self.yellow_ratio < self.yellow_low_thresh
+                    blue_high = self.blue_ratio > self.blue_high_thresh
+                    in_intersection_blind = yellow_low and blue_high
+
+                    if in_intersection_blind:
+                        # ── BLIND_STRAIGHT after turn ─────────────────
+                        steering, speed = self._blind_straight_output()
+                    else:
+                        # ── PID_THRU: lane data available (original) ──
+                        self.current_mode = MODE_PID
+                        self.nav2_status = 'PID_THRU'
+                        steering = self.lane_steering
+                        speed = self.lane_speed
+                        if self.pid_speed_override > 0.0:
+                            speed = self.pid_speed_override
+                        self._publish_motor(steering, speed)
+                        self.active_steering = steering
+                        self.active_speed = speed
 
                 else:
                     # Still correcting → bridge Nav2
@@ -592,6 +623,36 @@ class HybridSwitchController(Node):
             self.active_speed = speed
 
         self._publish_debug()
+
+    # =====================================================================
+    # BLIND_STRAIGHT helper — drive straight with heading correction
+    # =====================================================================
+    def _blind_straight_output(self):
+        """Compute steering+speed for blind intersection crossing.
+
+        Uses existing self.yellow_ratio, self.yaw_error, self.lane_steering.
+        Returns (steering, speed) and publishes motor command.
+        """
+        self.current_mode = MODE_PID
+        self.nav2_status = 'BLIND_STRAIGHT'
+
+        # Heading correction toward goal (gentle proportional)
+        heading_steer = clamp(
+            -self.blind_heading_kp * self.yaw_error,
+            -self.blind_max_steer, self.blind_max_steer)
+
+        # Gradual blend: as yellow_ratio rises toward threshold,
+        # mix in more PID steering for a smooth transition
+        blend_raw = self.yellow_ratio / max(self.yellow_low_thresh, 1e-6)
+        blend = clamp(blend_raw * self.blind_pid_blend, 0.0, self.blind_pid_blend)
+        steering = (1.0 - blend) * heading_steer + blend * self.lane_steering
+        speed = self.blind_drive_speed
+
+        self._publish_motor(steering, speed)
+        self.active_steering = steering
+        self.active_speed = speed
+
+        return steering, speed
 
     # =====================================================================
     # Send goal to Nav2 via /goal_pose

@@ -221,5 +221,9 @@ hybrid_switch_controller:
     retry_interval: 3.0            # seconds between retries
     yaw_error_threshold: 0.5       # rad — Nav2 only if |goal_yaw - robot_yaw| > this
 
-
+    # ── Blind-drive at intersections (no lane data for PID) ──
+    blind_drive_speed: 0.20        # forward speed (m/s)
+    blind_heading_kp: 0.5          # heading correction gain (yaw_error → steering)
+    blind_max_steer: 0.15          # max steering in blind mode (rad, ~8.5°)
+    blind_pid_blend: 0.3           # max PID blend weight when yellow partially visible
 

@@ -153,7 +153,12 @@ class BridgeMonitorNode(Node):
         a(f'{BLD}{CYN}╚══════════════════════════════════════════════════════════╝{RST}')
         a(f'')
         a(f'  FSM:  {fb}  Mode: {mb}  Gate: {gb}')
-        a(f'  Nav2: {CYN}{self.nav2_status:<12}{RST}')
+        # Nav2 status with BLIND_STRAIGHT highlight
+        if self.nav2_status == 'BLIND_STRAIGHT':
+            nav2_badge = f'\033[44m{WHT}{BLD} BLIND_STRAIGHT {RST}'
+        else:
+            nav2_badge = f'{CYN}{self.nav2_status:<12}{RST}'
+        a(f'  Nav2: {nav2_badge}')
         a(f'')
 
         # Pixels
