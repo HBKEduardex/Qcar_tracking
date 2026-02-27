@@ -190,39 +190,35 @@ controller_plotter:
 
 hybrid_switch_controller:
   ros__parameters:
-    # Angular switch threshold (rad) — if |yaw_error| > this → Nav2, else → PID
-    yaw_error_threshold: 1.4      # ~28°
+    # ── Pixel gating (FSM) ──
+    mask_topic: "/lokita"
+    use_bottom_ratio: 0.45
+    yellow_low_threshold: 0.04     # yellow_ratio below this = "no lane"
+    blue_high_threshold: 0.6      # blue_ratio above this = "intersection"
+    blue_exit_threshold: 0.3       # blue_ratio below this = exit Nav2
+    activate_frames: 3             # frames to enter NAV2_INTERSECTION
+    reacquire_frames: 5            # frames to exit NAV2_INTERSECTION
+    cooldown_sec: 3.0              # seconds in RECOVERY before PID_ROAD
+    gate_mode: "AND"               # AND / OR / YELLOW_ONLY
 
-    # Distance (m) to consider a mission goal reached
+    # ── Navigation ──
     goal_tolerance: 0.3
-
-    # Max Nav2 retries before skipping a goal
-    retry_limit: 5
-
-    # Control loop frequency
     rate_hz: 20.0
-
-    # TF frames
     map_frame: "map"
     base_frame: "base_link"
-
-    # Topics
     mission_goals_topic: "/mission_goals"
     motor_cmd_topic: "/qcar2_motor_speed_cmd"
     lane_cmd_topic: "/lane/motor_cmd"
-
-    # If > 0, override PID speed with this value (m/s). 0 = use PID speed.
-    pid_speed_override: 0.0
-
-    # Nav2 topics
     goal_pose_topic: "/goal_pose"
     cmd_vel_topic: "/cmd_vel_nav"
+    pid_speed_override: 0.0
 
-    # Nav2 cmd_vel → motor bridging
-    nav2_steer_gain: 1.0           # angular.z → steering gain
-    nav2_speed_scale: 1.0          # linear.x → speed scale
+    # ── Nav2 cmd_vel → motor bridging ──
+    nav2_speed_scale: 1.0
     max_angle: 0.45                # max steering (rad)
     max_speed: 0.30                # max speed (m/s)
-    nav2_timeout: 0.5              # seconds without cmd_vel → stop
+    nav2_timeout: 0.5              # seconds without cmd_vel → auto-retry
+    retry_interval: 3.0            # seconds between retries
+
 
 

@@ -1,20 +1,11 @@
-#!/usr/bin/env python3
 """
-Hybrid Switch Launch — Nav2 + Lane Tracking PID System
+Launch file for the Pixel-Gated Hybrid Switch System.
 
-Brings up:
-  1. yellow_line_follower_controller — PID lane following (publish_motor_cmd=false)
-  2. hybrid_switch_controller        — mode switching controller
-  3. bridge_monitor                   — terminal dashboard
-
-Usage:
-  ros2 launch qcar2_teleop hybrid_switch_launch.py
-  ros2 launch qcar2_teleop hybrid_switch_launch.py yaw_error_threshold:=0.6
+Launches:
+  1. yellow_line_follower_controller (PID, publish_motor_cmd=False)
+  2. hybrid_switch_controller (pixel-gated FSM, the ONLY motor publisher)
+  3. bridge_monitor (terminal display)
 """
-
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -22,131 +13,90 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    # ── Package paths ───────────────────────────────────────────────────────
-    teleop_dir = get_package_share_directory('qcar2_teleop')
-    tracking_config = os.path.join(teleop_dir, 'config', 'qcar2_tracking_params.yaml')
+    # ── Pixel gating params ─────────────────────────────────────────────
+    args = [
+        DeclareLaunchArgument('mask_topic', default_value='/lokita'),
+        DeclareLaunchArgument('use_bottom_ratio', default_value='0.45'),
+        DeclareLaunchArgument('yellow_low_threshold', default_value='0.04'),
+        DeclareLaunchArgument('blue_high_threshold', default_value='0.6'),
+        DeclareLaunchArgument('blue_exit_threshold', default_value='0.3'),
+        DeclareLaunchArgument('activate_frames', default_value='3'),
+        DeclareLaunchArgument('reacquire_frames', default_value='5'),
+        DeclareLaunchArgument('cooldown_sec', default_value='3.0'),
+        DeclareLaunchArgument('gate_mode', default_value='AND'),
 
-    # ── Launch arguments ────────────────────────────────────────────────────
-    declares = [
-        DeclareLaunchArgument(
-            'yaw_error_threshold', default_value='0.5',
-            description='Yaw error (rad) above which Nav2 is used instead of PID',
-        ),
-        DeclareLaunchArgument(
-            'goal_tolerance', default_value='0.3',
-            description='Distance (m) to consider a goal reached',
-        ),
-        DeclareLaunchArgument(
-            'retry_limit', default_value='5',
-            description='Max Nav2 retries before skipping a goal',
-        ),
-        DeclareLaunchArgument(
-            'rate_hz', default_value='20.0',
-            description='Control loop frequency (Hz)',
-        ),
-        DeclareLaunchArgument(
-            'map_frame', default_value='map',
-            description='TF map frame',
-        ),
-        DeclareLaunchArgument(
-            'base_frame', default_value='base_link',
-            description='TF base frame of the robot',
-        ),
-        DeclareLaunchArgument(
-            'mission_goals_topic', default_value='/mission_goals',
-            description='Topic for receiving mission goals from the planner',
-        ),
-        DeclareLaunchArgument(
-            'motor_cmd_topic', default_value='/qcar2_motor_speed_cmd',
-            description='Topic for publishing final motor commands',
-        ),
-        DeclareLaunchArgument(
-            'lane_cmd_topic', default_value='/lane/motor_cmd',
-            description='Topic for receiving PID lane-following commands',
-        ),
-        DeclareLaunchArgument(
-            'tracking_config', default_value=tracking_config,
-            description='Config YAML for lane following nodes',
-        ),
-        DeclareLaunchArgument(
-            'enable_monitor', default_value='true',
-            description='Launch the bridge monitor node',
-        ),
+        # Navigation
+        DeclareLaunchArgument('goal_tolerance', default_value='0.3'),
+        DeclareLaunchArgument('rate_hz', default_value='20.0'),
+        DeclareLaunchArgument('map_frame', default_value='map'),
+        DeclareLaunchArgument('base_frame', default_value='base_link'),
+        DeclareLaunchArgument('mission_goals_topic', default_value='/mission_goals'),
+        DeclareLaunchArgument('motor_cmd_topic', default_value='/qcar2_motor_speed_cmd'),
+        DeclareLaunchArgument('lane_cmd_topic', default_value='/lane/motor_cmd'),
+        DeclareLaunchArgument('goal_pose_topic', default_value='/goal_pose'),
+        DeclareLaunchArgument('cmd_vel_topic', default_value='/cmd_vel_nav'),
+        DeclareLaunchArgument('pid_speed_override', default_value='0.0'),
+
+        # Nav2 bridging
+        DeclareLaunchArgument('nav2_speed_scale', default_value='1.0'),
+        DeclareLaunchArgument('max_angle', default_value='0.45'),
+        DeclareLaunchArgument('max_speed', default_value='0.30'),
+        DeclareLaunchArgument('nav2_timeout', default_value='0.5'),
+        DeclareLaunchArgument('retry_interval', default_value='3.0'),
     ]
 
-    # ── Configurations ──────────────────────────────────────────────────────
-    yaw_thresh = LaunchConfiguration('yaw_error_threshold')
-    goal_tol = LaunchConfiguration('goal_tolerance')
-    retry_lim = LaunchConfiguration('retry_limit')
-    rate = LaunchConfiguration('rate_hz')
-    map_frame = LaunchConfiguration('map_frame')
-    base_frame = LaunchConfiguration('base_frame')
-    mission_topic = LaunchConfiguration('mission_goals_topic')
-    motor_topic = LaunchConfiguration('motor_cmd_topic')
-    lane_topic = LaunchConfiguration('lane_cmd_topic')
-    config = LaunchConfiguration('tracking_config')
-
-    # ═══════════════════════════════════════════════════════
-    # 1) Yellow Line Follower Controller (PID)
-    #    - publish_motor_cmd=false → only publishes /lane/motor_cmd
-    #    - hybrid_switch_controller decides when to use it
-    # ═══════════════════════════════════════════════════════
-    pid_controller = Node(
+    # ── PID Controller (output only, no motor publishing) ───────────────
+    pid_node = Node(
         package='qcar2_teleop',
         executable='yellow_line_follower_controller',
         name='yellow_line_follower_controller',
         output='screen',
-        parameters=[
-            config,
-            {
-                'publish_motor_cmd': False,
-                'send_speed_in_motor_cmd': True,
-            }
-        ],
-        emulate_tty=True,
+        parameters=[{
+            'publish_motor_cmd': False,
+            'motor_cmd_topic': LaunchConfiguration('lane_cmd_topic'),
+        }],
     )
 
-    # ═══════════════════════════════════════════════════════
-    # 2) Hybrid Switch Controller (NEW)
-    # ═══════════════════════════════════════════════════════
-    hybrid_controller = Node(
+    # ── Hybrid Switch Controller (pixel-gated) ─────────────────────────
+    hybrid_node = Node(
         package='qcar2_teleop',
         executable='hybrid_switch_controller',
         name='hybrid_switch_controller',
         output='screen',
         parameters=[{
-            'yaw_error_threshold': yaw_thresh,
-            'goal_tolerance': goal_tol,
-            'retry_limit': retry_lim,
-            'rate_hz': rate,
-            'map_frame': map_frame,
-            'base_frame': base_frame,
-            'mission_goals_topic': mission_topic,
-            'motor_cmd_topic': motor_topic,
-            'lane_cmd_topic': lane_topic,
+            'mask_topic': LaunchConfiguration('mask_topic'),
+            'use_bottom_ratio': LaunchConfiguration('use_bottom_ratio'),
+            'yellow_low_threshold': LaunchConfiguration('yellow_low_threshold'),
+            'blue_high_threshold': LaunchConfiguration('blue_high_threshold'),
+            'blue_exit_threshold': LaunchConfiguration('blue_exit_threshold'),
+            'activate_frames': LaunchConfiguration('activate_frames'),
+            'reacquire_frames': LaunchConfiguration('reacquire_frames'),
+            'cooldown_sec': LaunchConfiguration('cooldown_sec'),
+            'gate_mode': LaunchConfiguration('gate_mode'),
+            'goal_tolerance': LaunchConfiguration('goal_tolerance'),
+            'rate_hz': LaunchConfiguration('rate_hz'),
+            'map_frame': LaunchConfiguration('map_frame'),
+            'base_frame': LaunchConfiguration('base_frame'),
+            'mission_goals_topic': LaunchConfiguration('mission_goals_topic'),
+            'motor_cmd_topic': LaunchConfiguration('motor_cmd_topic'),
+            'lane_cmd_topic': LaunchConfiguration('lane_cmd_topic'),
+            'goal_pose_topic': LaunchConfiguration('goal_pose_topic'),
+            'cmd_vel_topic': LaunchConfiguration('cmd_vel_topic'),
+            'pid_speed_override': LaunchConfiguration('pid_speed_override'),
+            'nav2_speed_scale': LaunchConfiguration('nav2_speed_scale'),
+            'max_angle': LaunchConfiguration('max_angle'),
+            'max_speed': LaunchConfiguration('max_speed'),
+            'nav2_timeout': LaunchConfiguration('nav2_timeout'),
+            'retry_interval': LaunchConfiguration('retry_interval'),
         }],
-        emulate_tty=True,
     )
 
-    # ═══════════════════════════════════════════════════════
-    # 3) Bridge Monitor (optional)
-    # ═══════════════════════════════════════════════════════
-    bridge_monitor = Node(
+    # ── Bridge Monitor ──────────────────────────────────────────────────
+    monitor_node = Node(
         package='qcar2_teleop',
         executable='bridge_monitor',
         name='bridge_monitor',
         output='screen',
-        emulate_tty=True,
     )
 
-    # ── Build LaunchDescription ─────────────────────────────────────────────
-    ld = LaunchDescription()
-
-    for d in declares:
-        ld.add_action(d)
-
-    ld.add_action(pid_controller)
-    ld.add_action(hybrid_controller)
-    ld.add_action(bridge_monitor)
-
-    return ld
+    return LaunchDescription(args + [pid_node, hybrid_node, monitor_node])
