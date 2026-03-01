@@ -233,7 +233,7 @@ def generate_launch_description():
         ld.add_action(d)
 
     # 1) Hardware
-    ld.add_action(qcar2_virtual_launch)
+    #ld.add_action(qcar2_virtual_launch)
     ld.add_action(qcar2_to_lidar_tf)
 
     # 2) SLAM
