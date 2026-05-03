@@ -12,15 +12,15 @@ Publica:
   - /lane/center/visible (Bool)
   - /lane/curvature      (Float32)  ← NUEVO
 
-Debug: 2 ventanas separadas:
-  - lane_detection:  detección básica (centroides, lane center, estado)
-  - lane_prediction: curvas fiteadas, Ackermann, lookahead
+Debug: 2 imágenes publicadas en tópicos ROS2:
+  - /lane/debug/detection:  detección básica (centroides, lane center, estado)
+  - /lane/debug/prediction: curvas fiteadas, Ackermann, lookahead
 
 Author: eduardex
 """
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
 import numpy as np
@@ -52,7 +52,7 @@ class YellowLinePositionNode(Node):
         super().__init__('yellow_line_position_node')
 
         # ==================== Topics ====================
-        self.declare_parameter('mask_topic', '/segmentation/color_mask')
+        self.declare_parameter('mask_topic', '/segmentation/color_mask/compressed')
         self.declare_parameter('yellow_error_topic', '/lane/yellow/error')
         self.declare_parameter('yellow_visible_topic', '/lane/yellow/visible')
         self.declare_parameter('center_error_topic', '/lane/center/error')
@@ -73,6 +73,12 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('show_detection_window', True)
         self.declare_parameter('show_prediction_window', True)
 
+        # ==================== Debug image topics ====================
+        self.declare_parameter('publish_detection_debug_image', True)
+        self.declare_parameter('publish_prediction_debug_image', True)
+        self.declare_parameter('debug_detection_topic', '/lane/debug/detection')
+        self.declare_parameter('debug_prediction_topic', '/lane/debug/prediction')
+
         # ==================== Lane width learning ====================
         self.declare_parameter('default_lane_width_ratio', 0.40)
         self.declare_parameter('lane_width_ema_alpha', 0.20)
@@ -92,6 +98,11 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('curve_exit_frames', 5)
         self.declare_parameter('straight_offset_px', 22)  # positive = shift right (towards edge)
         self.declare_parameter('center_ema_alpha', 0.4)  # smoothing for lane center transitions
+
+        # ==================== Edge selection (rightmost only) ====================
+        self.declare_parameter('edge_select_rightmost', True)     # CALIBRATE: if True, keep only the rightmost edge cluster
+        self.declare_parameter('edge_min_component_area', 80)     # CALIBRATE: minimum pixel count for an edge cluster to be valid (reject noise)
+        self.declare_parameter('edge_max_components_keep', 1)     # CALIBRATE: how many rightmost clusters to keep (1 = strict rightmost only)
 
         # ==================== Sidewalk validation ====================
         self.declare_parameter('sidewalk_validate', True)        # CALIBRATE: enable/disable sidewalk check
@@ -123,6 +134,10 @@ class YellowLinePositionNode(Node):
 
         self.show_detection_window = bool(self.get_parameter('show_detection_window').value)
         self.show_prediction_window = bool(self.get_parameter('show_prediction_window').value)
+        self.publish_detection_debug = bool(self.get_parameter('publish_detection_debug_image').value)
+        self.publish_prediction_debug = bool(self.get_parameter('publish_prediction_debug_image').value)
+        self.debug_detection_topic = str(self.get_parameter('debug_detection_topic').value)
+        self.debug_prediction_topic = str(self.get_parameter('debug_prediction_topic').value)
 
         self.default_lane_width_ratio = float(self.get_parameter('default_lane_width_ratio').value)
         self.lane_width_ema_alpha = float(self.get_parameter('lane_width_ema_alpha').value)
@@ -141,6 +156,9 @@ class YellowLinePositionNode(Node):
         self.curve_exit_frames = int(self.get_parameter('curve_exit_frames').value)
         self.straight_offset_px = int(self.get_parameter('straight_offset_px').value)
         self.center_ema_alpha = float(self.get_parameter('center_ema_alpha').value)
+        self.edge_select_rightmost = bool(self.get_parameter('edge_select_rightmost').value)
+        self.edge_min_component_area = int(self.get_parameter('edge_min_component_area').value)
+        self.edge_max_components_keep = int(self.get_parameter('edge_max_components_keep').value)
         self.sidewalk_validate = bool(self.get_parameter('sidewalk_validate').value)
         self.min_road_ratio = float(self.get_parameter('min_road_ratio').value)
         self.validate_num_points = int(self.get_parameter('validate_num_points').value)
@@ -168,7 +186,15 @@ class YellowLinePositionNode(Node):
         self.last_extra_status = ''        # 'TRIANGLE', 'YEL_RISK', 'RATE_LIM'
 
         # ==================== ROS I/O ====================
-        self.sub = self.create_subscription(Image, self.mask_topic, self.cb_mask, 10)
+        if self.mask_topic.endswith('/compressed'):
+            self.sub = self.create_subscription(
+                CompressedImage, self.mask_topic, self.cb_mask_compressed, 10
+            )
+        else:
+            self.sub = self.create_subscription(
+                Image, self.mask_topic, self.cb_mask, 10
+            )
+
         self.pub_y_err = self.create_publisher(Float32, self.yellow_error_topic, 10)
         self.pub_y_vis = self.create_publisher(Bool, self.yellow_visible_topic, 10)
         self.pub_c_err = self.create_publisher(Float32, self.center_error_topic, 10)
@@ -177,16 +203,21 @@ class YellowLinePositionNode(Node):
         self.pub_edge_count = self.create_publisher(Float32, self.edge_count_topic, 10)
         self.pub_edge_position = self.create_publisher(Float32, self.edge_position_topic, 10)
 
-        if self.show_detection_window:
-            cv2.namedWindow('lane_detection', cv2.WINDOW_NORMAL)
-        if self.show_prediction_window:
-            cv2.namedWindow('lane_prediction', cv2.WINDOW_NORMAL)
+        # Debug image publishers
+        if self.publish_detection_debug:
+            self.pub_debug_detection = self.create_publisher(
+                Image, self.debug_detection_topic, 10)
+        if self.publish_prediction_debug:
+            self.pub_debug_prediction = self.create_publisher(
+                Image, self.debug_prediction_topic, 10)
 
         self.get_logger().info("YellowLinePositionNode started (dual mode: point / poly+Ackermann)")
         self.get_logger().info(f"  mask_topic: {self.mask_topic}")
         self.get_logger().info(f"  curvature_topic: {self.curvature_topic}")
         self.get_logger().info(f"  curvature_threshold: {self.curvature_threshold}")
         self.get_logger().info(f"  ackermann_gain: {self.ackermann_gain}")
+        self.get_logger().info(f"  publish_detection_debug: {self.publish_detection_debug} -> {self.debug_detection_topic}")
+        self.get_logger().info(f"  publish_prediction_debug: {self.publish_prediction_debug} -> {self.debug_prediction_topic}")
 
     # ================================================================
     #  Row-wise helpers (for polynomial mode)
@@ -221,6 +252,45 @@ class YellowLinePositionNode(Node):
             return np.polyfit(ys, xs, deg)
         except (np.linalg.LinAlgError, ValueError):
             return None
+
+    def _filter_edge_rightmost(self, edge_bin):
+        """Keep only the rightmost connected component(s) in the edge mask.
+
+        Uses cv2.connectedComponentsWithStats to find clusters, sorts by
+        mean-X descending, and keeps only the top N (edge_max_components_keep).
+        Components smaller than edge_min_component_area are discarded.
+
+        Returns a new binary mask with only the selected component(s).
+        """
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            edge_bin, connectivity=8)
+
+        if num_labels <= 1:  # only background
+            return edge_bin  # nothing to filter
+
+        # Collect valid components (skip label 0 = background)
+        valid = []
+        for lbl in range(1, num_labels):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if area >= self.edge_min_component_area:
+                mean_x = centroids[lbl][0]  # x-coordinate of centroid
+                valid.append((lbl, mean_x, area))
+
+        if not valid:
+            return np.zeros_like(edge_bin)  # all components too small
+
+        # Sort by mean-X descending (rightmost first)
+        valid.sort(key=lambda t: t[1], reverse=True)
+
+        # Keep only the N rightmost
+        keep = valid[:self.edge_max_components_keep]
+
+        # Build filtered mask
+        filtered = np.zeros_like(edge_bin)
+        for lbl, _, _ in keep:
+            filtered[labels == lbl] = 255
+
+        return filtered
 
     def _edge_cx_rightmost_median(self, edge_bin, w):
         """Robust edge: rightmost pixel per row, then median."""
@@ -333,14 +403,23 @@ class YellowLinePositionNode(Node):
         # Nothing worked, return original (better than nothing)
         return lane_center_x, ''
 
-    # ================================================================
-    #  Main callback
-    # ================================================================
     def cb_mask(self, msg: Image):
         mask_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         if mask_bgr is None or mask_bgr.size == 0:
             return
+        self._process_mask(mask_bgr)
 
+    def cb_mask_compressed(self, msg: CompressedImage):
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        mask_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if mask_bgr is None or mask_bgr.size == 0:
+            return
+        self._process_mask(mask_bgr)
+
+    # ================================================================
+    #  Main callback
+    # ================================================================
+    def _process_mask(self, mask_bgr):
         H, W = mask_bgr.shape[:2]
         y0 = int(H * (1.0 - self.use_bottom_ratio))
         roi = mask_bgr[y0:, :]
@@ -414,6 +493,10 @@ class YellowLinePositionNode(Node):
         edge_bin = ((r > 150) & (g < 100) & (b < 100)).astype(np.uint8) * 255
         edge_bin = cv2.morphologyEx(edge_bin, cv2.MORPH_OPEN, kernel, iterations=1)
         edge_bin = cv2.morphologyEx(edge_bin, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # --- Filter: keep only rightmost edge cluster(s) ---
+        if self.edge_select_rightmost:
+            edge_bin = self._filter_edge_rightmost(edge_bin)
 
         edge_pixels = int(cv2.countNonZero(edge_bin))
         edge_visible = edge_pixels >= self.min_edge_pixels
@@ -642,8 +725,8 @@ class YellowLinePositionNode(Node):
             edge_position_norm = 999.0  # Valor especial: sin detección
         self.pub_edge_position.publish(Float32(data=edge_position_norm))
 
-        # ================== 6) Debug windows ==================
-        if self.show_detection_window:
+        # ================== 6) Debug image publishing ==================
+        if self.publish_detection_debug:
             self._draw_detection(
                 roi, h, w, center_img_x,
                 yellow_visible, yellow_cx, edge_visible, edge_cx,
@@ -651,7 +734,7 @@ class YellowLinePositionNode(Node):
                 yellow_pixels, edge_pixels, yellow_error, center_error, curvature,
             )
 
-        if self.show_prediction_window:
+        if self.publish_prediction_debug:
             self._draw_prediction(
                 roi, h, w,
                 yellow_poly, y_ys, y_xs,
@@ -726,11 +809,8 @@ class YellowLinePositionNode(Node):
                         f"!! {self.last_extra_status} !!",
                         (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, extra_clr, 2)
 
-        cv2.imshow('lane_detection', dbg)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:
-            self.show_detection_window = False
-            cv2.destroyWindow('lane_detection')
+        msg = self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8')
+        self.pub_debug_detection.publish(msg)
 
     # ================================================================
     #  Window 2: Prediction (polynomial curves)
@@ -796,11 +876,8 @@ class YellowLinePositionNode(Node):
         cv2.putText(dbg, "=== CENTER Ackermann", (10, ly + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_CENTER_ACK, 1)
         cv2.putText(dbg, " o  LOOKAHEAD", (10, ly + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_LOOKAHEAD, 1)
 
-        cv2.imshow('lane_prediction', dbg)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27:
-            self.show_prediction_window = False
-            cv2.destroyWindow('lane_prediction')
+        msg = self.bridge.cv2_to_imgmsg(dbg, encoding='bgr8')
+        self.pub_debug_prediction.publish(msg)
 
 
 def main(args=None):
@@ -811,7 +888,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
