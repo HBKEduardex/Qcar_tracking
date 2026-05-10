@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Yellow Line Position Node — Dual Mode (Point / Polynomial)
+Yellow Line Position Node — Edge-Only Mode (Point / Polynomial)
 
-Modo RECTA: centroide simple (yellow + edge) → error lateral directo.
-Modo CURVA: fit polinomial + offset Ackermann + lookahead.
+Modo RECTA: centroide del edge derecho desplazado hacia centro.
+Modo CURVA: fit polinomial al edge + offset Ackermann + lookahead.
 
 Publica:
   - /lane/yellow/error   (Float32)
@@ -20,6 +20,7 @@ Author: eduardex
 """
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
@@ -80,7 +81,7 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('debug_prediction_topic', '/lane/debug/prediction')
 
         # ==================== Lane width learning ====================
-        self.declare_parameter('default_lane_width_ratio', 0.40)
+        self.declare_parameter('default_lane_width_ratio', 0.4)
         self.declare_parameter('lane_width_ema_alpha', 0.20)
         self.declare_parameter('min_lane_width_ratio', 0.25)
         self.declare_parameter('max_lane_width_ratio', 0.95)
@@ -96,7 +97,8 @@ class YellowLinePositionNode(Node):
         self.declare_parameter('edge_ema_alpha', 0.3)
         self.declare_parameter('curvature_ema_alpha', 0.15)
         self.declare_parameter('curve_exit_frames', 5)
-        self.declare_parameter('straight_offset_px', 22)  # positive = shift right (towards edge)
+        self.declare_parameter('straight_offset_px', 35)  # positive = shift right (towards edge)
+        self.declare_parameter('edge_only_offset_px', -20)  # additional offset for edge-only mode
         self.declare_parameter('center_ema_alpha', 0.4)  # smoothing for lane center transitions
 
         # ==================== Edge selection (rightmost only) ====================
@@ -155,6 +157,7 @@ class YellowLinePositionNode(Node):
         self.curvature_ema_alpha = float(self.get_parameter('curvature_ema_alpha').value)
         self.curve_exit_frames = int(self.get_parameter('curve_exit_frames').value)
         self.straight_offset_px = int(self.get_parameter('straight_offset_px').value)
+        self.edge_only_offset_px = int(self.get_parameter('edge_only_offset_px').value)
         self.center_ema_alpha = float(self.get_parameter('center_ema_alpha').value)
         self.edge_select_rightmost = bool(self.get_parameter('edge_select_rightmost').value)
         self.edge_min_component_area = int(self.get_parameter('edge_min_component_area').value)
@@ -173,7 +176,7 @@ class YellowLinePositionNode(Node):
         self.bridge = CvBridge()
         self.last_lane_center_x = None
         self.center_has_value = False
-        self.lane_width_px = None
+        # lane_width_px is now fixed (no dynamic learning from yellow)
         self.last_edge_cx = None           # edge memory
         self.edge_lost_count = 0           # frames since edge was last seen
         self.last_edge_poly = None         # polynomial memory
@@ -218,6 +221,21 @@ class YellowLinePositionNode(Node):
         self.get_logger().info(f"  ackermann_gain: {self.ackermann_gain}")
         self.get_logger().info(f"  publish_detection_debug: {self.publish_detection_debug} -> {self.debug_detection_topic}")
         self.get_logger().info(f"  publish_prediction_debug: {self.publish_prediction_debug} -> {self.debug_prediction_topic}")
+
+        # Parameter callback
+        self.add_on_set_parameters_callback(self._on_params_changed)
+
+    def _on_params_changed(self, params):
+        for p in params:
+            if hasattr(self, p.name):
+                # Update the parameter dynamically
+                setattr(self, p.name, p.value)
+            
+            # Special handling for lane width recalculation
+            if p.name == 'default_lane_width_ratio':
+                self.lane_width_px = None
+                
+        return SetParametersResult(successful=True)
 
     # ================================================================
     #  Row-wise helpers (for polynomial mode)
@@ -376,18 +394,10 @@ class YellowLinePositionNode(Node):
         # --- Step 2: Flip offset direction ---
         # Determine base point and reverse the offset
         flipped_x = None
-        if yellow_cx is not None and edge_cx is not None:
-            # Both visible: center was average, flip by shifting opposite to offset
-            flipped_x = int(clamp(
-                (yellow_cx + edge_cx) / 2.0 - offset_px, 0, w - 1))
-        elif edge_cx is not None:
+        if edge_cx is not None:
             # Edge only: was shifting left, now shift right
             flipped_x = int(clamp(
                 edge_cx + 0.5 * lane_width_px + offset_px, 0, w - 1))
-        elif yellow_cx is not None:
-            # Yellow only: was shifting right, now shift left
-            flipped_x = int(clamp(
-                yellow_cx - 0.5 * lane_width_px - offset_px, 0, w - 1))
 
         if flipped_x is not None:
             flip_ratio = self._road_ratio_at_x(roi_bgr, flipped_x, h)
@@ -430,63 +440,19 @@ class YellowLinePositionNode(Node):
         sample_ys = np.linspace(h - 5, 5, self.num_sample_rows, dtype=int)
 
         # ================== 1) Yellow detection ==================
-        roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lower_y = np.array([20, 120, 120], dtype=np.uint8)
-        upper_y = np.array([40, 255, 255], dtype=np.uint8)
-        yellow_bin = cv2.inRange(roi_hsv, lower_y, upper_y)
-        yellow_bin = cv2.morphologyEx(yellow_bin, cv2.MORPH_OPEN, kernel, iterations=1)
-        yellow_bin = cv2.morphologyEx(yellow_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        yellow_pixels = int(cv2.countNonZero(yellow_bin))
-        yellow_visible = yellow_pixels >= self.min_yellow_pixels
-
-        # Centroid (for point mode)
+        # Desactivar toda dependencia de amarillo:
+        yellow_visible = False
+        yellow_for_center = False
         yellow_cx = None
-        if yellow_visible:
-            M = cv2.moments(yellow_bin)
-            if M["m00"] > 0:
-                yellow_cx = int(M["m10"] / M["m00"])
-            else:
-                yellow_visible = False
-
-        # Yellow error (always from centroid, backward compat)
-        if yellow_visible and yellow_cx is not None:
-            yellow_error = (yellow_cx - (w / 2.0)) / (w / 2.0)
-            yellow_error = float(clamp(yellow_error, -1.0, 1.0))
-        else:
-            yellow_error = 0.0
+        yellow_cx_for_center = None
+        yellow_poly = None
+        yellow_pixels = 0
+        yellow_error = 0.0
+        
+        self.triangle_active = False
 
         self.pub_y_vis.publish(Bool(data=yellow_visible))
         self.pub_y_err.publish(Float32(data=yellow_error))
-
-        # ---- Triangle / double yellow detection (area-based) ----
-        roi_area = float(h * w) if (h * w) > 0 else 1.0
-        yellow_area_ratio = yellow_pixels / roi_area
-        if self.triangle_active:
-            # Currently in triangle mode — check exit condition
-            if yellow_area_ratio < self.yellow_area_exit_ratio:
-                self.triangle_count += 1
-            else:
-                self.triangle_count = 0
-            if self.triangle_count >= self.triangle_exit_frames:
-                self.triangle_active = False
-                self.triangle_count = 0
-        else:
-            # Check enter condition
-            if yellow_area_ratio > self.yellow_area_enter_ratio:
-                self.triangle_count += 1
-            else:
-                self.triangle_count = max(0, self.triangle_count - 1)
-            if self.triangle_count >= self.triangle_enter_frames:
-                self.triangle_active = True
-                self.triangle_count = 0
-
-        # When triangle mode is active, suppress yellow for center calc only
-        yellow_for_center = yellow_visible  # original visibility
-        yellow_cx_for_center = yellow_cx    # original centroid
-        if self.triangle_active:
-            yellow_for_center = False
-            yellow_cx_for_center = None
 
         # ================== 2) Edge detection ==================
         b, g, r = cv2.split(roi)
@@ -534,11 +500,6 @@ class YellowLinePositionNode(Node):
         curvature = 0.0
         poly_valid = False
 
-        if yellow_for_center:  # use suppressed flag (triangle-aware)
-            y_ys, y_xs = self._sample_yellow_per_row(yellow_bin, sample_ys)
-            if len(y_ys) >= self.min_fit_points:
-                yellow_poly = self._safe_polyfit(y_ys, y_xs, self.poly_degree)
-
         if edge_visible:
             e_ys, e_xs = self._sample_edge_per_row(edge_bin, sample_ys, w)
             if len(e_ys) >= self.min_fit_points:
@@ -550,26 +511,15 @@ class YellowLinePositionNode(Node):
         if edge_poly is None and self.last_edge_poly is not None and self.edge_lost_count <= self.edge_hold_frames:
             edge_poly = self.last_edge_poly.copy()
 
-        # Center poly (uses triangle-suppressed yellow_poly)
+        # Fixed edge-to-center offset
+        edge_to_center_px = self.default_lane_width_ratio * w
+
+        # Center poly (uses edge_poly only)
         if edge_poly is not None:
-            if yellow_poly is not None:
-                center_poly = (np.array(yellow_poly) + np.array(edge_poly)) / 2.0
-            else:
-                # Edge only → shift left by half lane width
-                offset_poly = np.array(edge_poly).copy()
-                if self.lane_width_px is not None:
-                    offset_poly[-1] -= 0.5 * float(self.lane_width_px)
-                else:
-                    offset_poly[-1] -= 0.5 * self.default_lane_width_ratio * w
-                center_poly = offset_poly
-            poly_valid = True
-        elif yellow_poly is not None:
-            # Yellow only → shift right by half lane width (inverse)
-            offset_poly = np.array(yellow_poly).copy()
-            if self.lane_width_px is not None:
-                offset_poly[-1] += 0.5 * float(self.lane_width_px)
-            else:
-                offset_poly[-1] += 0.5 * self.default_lane_width_ratio * w
+            # Edge only → shift left by edge_to_center_px
+            offset_poly = np.array(edge_poly).copy()
+            offset_poly[-1] -= edge_to_center_px
+            offset_poly[-1] += self.straight_offset_px + self.edge_only_offset_px
             center_poly = offset_poly
             poly_valid = True
 
@@ -594,20 +544,8 @@ class YellowLinePositionNode(Node):
         self.pub_curv.publish(Float32(data=curvature))
 
         # ================== 4) Learn lane width ==================
-        # Always learn from original detections (not triangle-suppressed)
-        if yellow_visible and edge_visible and yellow_cx is not None and edge_cx is not None:
-            width_px_meas = float(edge_cx - yellow_cx)
-            min_w = self.min_lane_width_ratio * w
-            max_w = self.max_lane_width_ratio * w
-            if min_w <= width_px_meas <= max_w:
-                if self.lane_width_px is None:
-                    self.lane_width_px = width_px_meas
-                else:
-                    a = float(clamp(self.lane_width_ema_alpha, 0.0, 1.0))
-                    self.lane_width_px = (1.0 - a) * self.lane_width_px + a * width_px_meas
-
-        if self.lane_width_px is None:
-            self.lane_width_px = float(clamp(self.default_lane_width_ratio, 0.05, 0.99)) * w
+        # Desactivado. Usamos valor estático.
+        self.lane_width_px = edge_to_center_px * 2.0
 
         # ================== 5) Decide mode & compute error ==================
         # Hysteresis: enter curve immediately, but require N straight frames to exit
@@ -629,20 +567,10 @@ class YellowLinePositionNode(Node):
             self.last_lane_center_x = lane_center_x
             self.center_has_value = True
         else:
-            # ---- STRAIGHT MODE: simple point centroid (triangle-aware) ----
+            # ---- STRAIGHT MODE: simple point centroid from edge ----
             if edge_visible and edge_cx is not None:
-                if yellow_for_center and yellow_cx_for_center is not None:
-                    lane_center_x = int((yellow_cx_for_center + edge_cx) / 2.0)
-                else:
-                    # Edge only (or triangle suppressed yellow) → shift left
-                    lane_center_x = int(edge_cx - 0.5 * float(self.lane_width_px))
-                lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
-                self.last_lane_center_x = lane_center_x
-                self.center_has_value = True
-            elif yellow_for_center and yellow_cx_for_center is not None:
-                # Yellow only (not suppressed) → shift right (inverse)
-                lane_center_x = int(yellow_cx_for_center + 0.5 * float(self.lane_width_px))
-                lane_center_x = int(clamp(lane_center_x + self.straight_offset_px, 0, w - 1))
+                lane_center_x = int(edge_cx - edge_to_center_px + self.straight_offset_px + self.edge_only_offset_px)
+                lane_center_x = int(clamp(lane_center_x, 0, w - 1))
                 self.last_lane_center_x = lane_center_x
                 self.center_has_value = True
             else:
@@ -652,23 +580,17 @@ class YellowLinePositionNode(Node):
 
         # ================== Yellow proximity risk ==================
         self.last_extra_status = ''
-        if (lane_center_x is not None and yellow_visible and yellow_cx is not None
-                and not self.triangle_active):
-            dist_to_yellow = lane_center_x - yellow_cx
-            if dist_to_yellow < self.yellow_safety_margin_px:
-                lane_center_x = int(clamp(
-                    yellow_cx + self.yellow_safety_margin_px, 0, w - 1))
-                self.last_extra_status = 'YEL_RISK'
+        # Eliminado/desactivado
 
         # ================== Sidewalk validation ==================
         self.last_validation_status = ''
         if lane_center_x is not None:
             lane_center_x, self.last_validation_status = self._validate_and_fix_center(
                 roi, lane_center_x, h, w,
-                yellow_cx_for_center if yellow_for_center else None,
+                None,  # yellow always None
                 edge_cx if edge_visible else None,
                 float(self.lane_width_px),
-                self.straight_offset_px if not in_curve else 0,
+                self.straight_offset_px + self.edge_only_offset_px if not in_curve else 0,
             )
 
         # ================== Rate limiter ==================
@@ -703,13 +625,8 @@ class YellowLinePositionNode(Node):
 
         # Publicar edge_count para hybrid_controller (forced Nav2 logic)
         # edge_count representa la "calidad" de detección:
-        #   0 = nada detectado (todo negro)
-        #   1 = solo un elemento (edge OR yellow, pero no ambos)
-        #   2 = detección completa (edge AND yellow, o equivalente)
-        if yellow_visible and edge_visible:
-            edge_count = 2.0  # Detección completa
-        elif yellow_visible or edge_visible:
-            edge_count = 1.0  # Solo un elemento
+        if edge_visible:
+            edge_count = 1.0  # Edge detectado
         else:
             edge_count = 0.0  # Nada detectado
         self.pub_edge_count.publish(Float32(data=edge_count))
@@ -758,11 +675,7 @@ class YellowLinePositionNode(Node):
         # Image center
         cv2.line(dbg, (center_img_x, 0), (center_img_x, h), self.CLR_IMG_CENTER, 1)
 
-        # Yellow centroid
-        if yellow_visible and yellow_cx is not None:
-            cv2.circle(dbg, (yellow_cx, int(h * 0.60)), 8, self.CLR_YELLOW_DOT, -1)
-            cv2.putText(dbg, "YELLOW", (yellow_cx + 12, int(h * 0.60)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.CLR_YELLOW_DOT, 2)
+        # Yellow centroid (removed)
 
         # Edge centroid
         if edge_visible and edge_cx is not None:
@@ -780,20 +693,16 @@ class YellowLinePositionNode(Node):
         mode_str = "CURVA" if in_curve else "RECTA"
         mode_clr = self.CLR_CENTER_ACK if in_curve else self.CLR_TEXT
         cv2.putText(dbg,
-                    f"Yvis={yellow_visible} pix={yellow_pixels} | Evis={edge_visible} pix={edge_pixels}",
+                    f"Evis={edge_visible} pix={edge_pixels}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.CLR_TEXT, 2)
         cv2.putText(dbg,
-                    f"Yerr={yellow_error:+.2f} | Cerr={center_error:+.2f} | lw={float(self.lane_width_px):.0f}px",
+                    f"Cerr={center_error:+.2f} | offset={float(self.straight_offset_px + self.edge_only_offset_px):.0f}px",
                     (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, self.CLR_TEXT, 2)
         cv2.putText(dbg,
                     f"MODO: {mode_str} | curv={curvature:.5f}",
                     (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_clr, 2)
         # Validation + extra status indicators
         status_y = 100
-        if self.triangle_active:
-            cv2.putText(dbg, '!! TRIANGLE !!',
-                        (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            status_y += 25
         if self.last_validation_status:
             val_clr = (0, 165, 255) if self.last_validation_status == 'FLIP' else (0, 0, 255)
             cv2.putText(dbg,
@@ -834,11 +743,7 @@ class YellowLinePositionNode(Node):
             if len(pts) > 1:
                 cv2.polylines(dbg, [np.array(pts)], False, color, thickness, cv2.LINE_AA)
 
-        # Yellow fit + sample points
-        if yellow_poly is not None:
-            _draw_poly(yellow_poly, self.CLR_YELLOW_FIT, 2)
-            for yy, xx in zip(y_ys, y_xs):
-                cv2.circle(dbg, (int(xx), int(yy)), 3, self.CLR_YELLOW_FIT, -1)
+        # Yellow fit + sample points (removed)
 
         # Edge fit + sample points
         if edge_poly is not None:
@@ -870,7 +775,6 @@ class YellowLinePositionNode(Node):
 
         # Legend
         ly = h - 65
-        cv2.putText(dbg, "--- YELLOW fit", (10, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_YELLOW_FIT, 1)
         cv2.putText(dbg, "--- EDGE fit", (10, ly + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_EDGE_FIT, 1)
         cv2.putText(dbg, "--- CENTER raw", (10, ly + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_CENTER_RAW, 1)
         cv2.putText(dbg, "=== CENTER Ackermann", (10, ly + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.4, self.CLR_CENTER_ACK, 1)
