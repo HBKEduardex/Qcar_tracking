@@ -71,7 +71,7 @@ class Nav2MotorTest(Node):
         self.declare_parameter('timeout', 0.5)
         self.declare_parameter('rate_hz', 20.0)
         self.declare_parameter('goal_tolerance', 0.3)
-        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('map_frame', 'pgm_map')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('retry_interval', 3.0)    # seconds between retries
 

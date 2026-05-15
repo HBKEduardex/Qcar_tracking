@@ -115,7 +115,7 @@ class HybridSwitchController(Node):
         # ── Parameters: navigation ──────────────────────────────────────
         self.declare_parameter('goal_tolerance', 0.3)
         self.declare_parameter('rate_hz', 20.0)
-        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('map_frame', 'pgm_map')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('mission_goals_topic', '/mission_goals')
         self.declare_parameter('motor_cmd_topic', '/qcar2_motor_speed_cmd')

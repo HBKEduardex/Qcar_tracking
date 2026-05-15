@@ -28,7 +28,7 @@ def generate_launch_description():
         # Navigation
         DeclareLaunchArgument('goal_tolerance', default_value='0.3'),
         DeclareLaunchArgument('rate_hz', default_value='20.0'),
-        DeclareLaunchArgument('map_frame', default_value='map'),
+        DeclareLaunchArgument('map_frame', default_value='pgm_map'),
         DeclareLaunchArgument('base_frame', default_value='base_link'),
         DeclareLaunchArgument('mission_goals_topic', default_value='/mission_goals'),
         DeclareLaunchArgument('motor_cmd_topic', default_value='/qcar2_motor_speed_cmd'),

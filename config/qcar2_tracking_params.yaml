@@ -202,7 +202,7 @@ hybrid_switch_controller:
     # ── Navigation ──
     goal_tolerance: 0.3
     rate_hz: 20.0
-    map_frame: "map"
+    map_frame: "pgm_map"
     base_frame: "base_link"
     mission_goals_topic: "/mission_goals"
     motor_cmd_topic: "/qcar2_motor_speed_cmd"
