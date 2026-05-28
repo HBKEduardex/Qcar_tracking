@@ -39,6 +39,7 @@ setup(
             'mamada = qcar2_teleop.mamada:main',
             'hybrid_switch_controller = qcar2_teleop.hybrid_switch_controller_node:main',
             'nav2_motor_test = qcar2_teleop.nav2_motor_test:main',
+            'mppi_tracking_node = qcar2_teleop.mppi_tracking_node:main',
         ],
     },
 )

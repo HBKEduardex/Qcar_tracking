@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# MPPI Tracking Controller Parameters — QCar2
+# ═══════════════════════════════════════════════════════════════════════════
+# Replaces Nav2 controller for continuous semigoal trajectory following.
+# Publishes MotorCommands to /nav2/motor_cmd (goes through mixer safety).
+#
+# TUNING GUIDE:
+#   Oscillates       → increase weight_control_smoothness, decrease steering_noise_std
+#   Turns too late    → increase lookahead_semigoals, increase weight_yaw_error
+#   Opens on curves   → increase weight_path_tracking, decrease max_steering_angle
+#   Stops between SGs → decrease semigoal_reached_distance
+#   Overshoots        → increase weight_terminal_error, decrease max_speed
+#   Too slow          → increase max_speed, decrease weight_control_effort
+#   Too aggressive    → decrease max_steering_angle, increase weight_control_smoothness
+# ═══════════════════════════════════════════════════════════════════════════
+
+mppi_tracking_node:
+  ros__parameters:
+    enabled: true
+
+    # ── Frames & Topics (must match project conventions) ────────────────
+    map_frame: "pgm_map"
+    base_frame: "base_link"
+    semigoals_topic: "/mission_goals"
+    cmd_output_topic: "/nav2/motor_cmd"
+
+    # ── Control frequency ───────────────────────────────────────────────
+    control_frequency: 20.0     # Hz
+
+    # ── MPPI core parameters ────────────────────────────────────────────
+    horizon_steps: 15           # number of prediction steps
+    dt: 0.05                    # time step for simulation (s)
+    num_samples: 500            # number of trajectory samples
+    lambda_temperature: 1.0     # softmax temperature (higher = more exploration)
+
+    # ── Velocity & steering limits ──────────────────────────────────────
+    max_speed: 0.6           # m/s forward
+    min_speed: 0.05             # m/s minimum when moving
+    max_reverse_speed: -0.2      # m/s (0 = no reverse)
+    max_steering_angle: 0.65    # rad (~37°)
+    wheelbase: 0.45            # QCar2 wheelbase (m)
+
+    # ── Exploration noise ───────────────────────────────────────────────
+    speed_noise_std: 0.36      # standard deviation for speed perturbation
+    steering_noise_std: 0.8    # standard deviation for steering perturbation
+
+    # ── Cost weights ────────────────────────────────────────────────────
+    weight_position_error: 42.0    # distance to current semigoal
+    weight_yaw_error: 0.5         # heading alignment to semigoal
+    weight_path_tracking: 5.0     # proximity to nearest reference point
+    weight_control_effort: 0.2    # penalize large controls
+    weight_control_smoothness: 1.0 # penalize jerky control changes
+    weight_progress: 2.0          # reward forward progress
+    weight_terminal_error: 10.0   # distance to furthest lookahead point
+
+    # ── Semigoal management ─────────────────────────────────────────────
+    lookahead_semigoals: 5        # how many semigoals ahead to use as horizon
+    semigoal_reached_distance: 0.12  # m — distance to consider semigoal reached
+    semigoal_reached_yaw_deg: 1.0   # deg — yaw tolerance (not used for advance)
+    allow_skip_semigoals: true    # allow skipping past semigoals
+    max_semigoal_skip: 3          # max semigoals to skip at once
+
+    # ── Safety ──────────────────────────────────────────────────────────
+    stop_if_no_pose: true         # stop if TF lookup fails
+    stop_if_no_semigoals: true    # stop if no semigoals available
+    command_timeout_sec: 0.5      # timeout for stale commands
+
+    # ── Debug ───────────────────────────────────────────────────────────
+    publish_debug: true
+    debug_topic: "/mppi_tracking/debug"
